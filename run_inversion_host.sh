@@ -6,9 +6,9 @@ rm output_*.csv
 rm output_*.xyz
 
 # Compilation.
-nvfortran -cuda -gpu=rdc -c gram_joint_inversion.cuf -o gram_joint_inversion.o -cudalib=cublas -lblas
-nvfortran -cuda -gpu=rdc -c parameters.f08 -o parameters.o
-nvfortran *.o -cuda -gpu=rdc -cudalib=cublas -lblas -llapack -Mlarge_arrays #-cuda=fastmath #-g -O3 -Mfprelaxed  # -Mcuda=ptxinfo
+gfortran -pg -c gram_joint_inversion_host.f08 -o gram_joint_inversion_host.o -llapack -lblas
+gfortran -pg -c parameters.f08 -o parameters.o
+gfortran -Wall -g -pg *.o -llapack -lblas -Ofast
 
 # Execution.
 mv a.out run_inversion.exe
@@ -21,8 +21,6 @@ cp output_jointGram_gv_minv_iter30.csv output_jointGram_gv_minv_iter30.xyz
 cp output_jointGram_mg_minv_iter30.csv output_jointGram_mg_minv_iter30.xyz
 
 #Profiling.
-#cuda-memcheck ./run_inversion.exe
-#cuda-gdb ./run_inversion.exe
 #gprof ./run_inversion.exe
 
 # Clean up temporary files.
