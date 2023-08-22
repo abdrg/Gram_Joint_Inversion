@@ -10,8 +10,9 @@ contains
 !*******************************************************************************
 subroutine jointGramCPU(m,n,xobs,yobs,zobs_gv,zobs_mg,xcell,ycell,zcell,d_gv,stdevd_gv,m_gv,stdevm_gv,mapr_gv,A_gv, &
                      d_mg,stdevd_mg,m_mg,stdevm_mg,mapr_mg,A_mg,param_reg,dip,strike,num_iters,err0)
-! Subrutina que calcula inversion conjunta de dos modelos gravimétrico y magnético
-! considerando similitud estructural evaluada por gradientes cruzados implementada mediante el enfoque Gramiano.
+! Subroutine that calculates joint inversion of two gravimetric and magnetic models
+! considering structural similarity evaluated by crossed gradients implemented through the Gramian approach.
+! Calculation completely in CPU, slower but not limited by VRAM memory of the card.
 
 use iso_fortran_env , dp => real64
 implicit none
@@ -379,9 +380,9 @@ end subroutine jointGramCPU
 
 subroutine jointGramGPU(m,n,xobs,yobs,zobs_gv,zobs_mg,xcell,ycell,zcell,d_gv,stdevd_gv,m_gv,stdevm_gv,mapr_gv,A_gv, &
                         d_mg,stdevd_mg,m_mg,stdevm_mg,mapr_mg,A_mg,param_reg,dip,strike,num_iters,err0)
-! Subrutina que calcula inversion conjunta de dos modelos gravimétrico y magnético
-! considerando similitud estructural evaluada por gradientes cruzados implementada mediante el enfoque Gramiano.
-! Empleando cuBlas en todo el proceso, calculo casi completamente en GPU, más rápido pero limitado a memoria VRAM de la tarjeta.
+! Subroutine that calculates joint inversion of two gravimetric and magnetic models
+! considering structural similarity evaluated by crossed gradients implemented through the Gramian approach.
+! Using cuBLAS, computed almost entirely on GPU, faster but limited to card VRAM.
 
 use cudafor
 use cublas_v2
@@ -1003,9 +1004,9 @@ end subroutine jointGramGPU
 
  subroutine jointGramCPUGPU(m,n,xobs,yobs,zobs_gv,zobs_mg,xcell,ycell,zcell,d_gv,stdevd_gv,m_gv,stdevm_gv,mapr_gv,A_gv, &
                         d_mg,stdevd_mg,m_mg,stdevm_mg,mapr_mg,A_mg,param_reg,dip,strike,num_iters,err0)
-! Subrutina que calcula inversion conjunta de dos modelos gravimétrico y magnético
-! considerando similitud estructural evaluada por gradientes cruzados implementada mediante el enfoque Gramiano.
-! Procesamiento en CPU y GPU optimizado, balance entre uso de memorias RAM y VRAM.
+! Subroutine that calculates joint inversion of two gravimetric and magnetic models
+! considering structural similarity evaluated by crossed gradients implemented through the Gramian approach.
+! Optimized CPU and GPU processing, balance between the use of RAM and VRAM memories.
 
 use cudafor
 use cublas_v2
@@ -1624,6 +1625,7 @@ deallocate ( A_gv,A_mg,d_gv,d_mg, xobs,yobs,zobs_gv,zobs_mg,xcell,ycell,zcell )
 
 return
 end subroutine jointGramCPUGPU
+!*******************************************************************************
 
 
 ! Auxiliar subroutines

@@ -5,7 +5,7 @@ program parameters
 !***********************************************************************************************************************************
 
 use iso_fortran_env , dp => real64
-use gram_joint_inversion 
+!use gram_joint_inversion 
 use gram_joint_inversion_host
 
 implicit none
@@ -31,22 +31,22 @@ Fd = 45 !degree
 
 !*************************
 ! REGULARIZATION PARAMETERS 
-reg(1) = 1 !alpha_gv /smoothness
-reg(2) = 1 !alpha_mg
-reg(3) = 1 !beta_gv /a-priori information
-reg(4) = 1 !beta_mg
-reg(5) = 1 !gamma_gv /dip and strike
-reg(6) = 1 !gamma_mg
+reg(1) = 1e2 !alpha_gv /smoothness
+reg(2) = 1e2 !alpha_mg
+reg(3) = 2e0 !beta_gv /a-priori information
+reg(4) = 9e-1 !beta_mg
+reg(5) = 1e5 !gamma_gv /dip and strike
+reg(6) = 1e5 !gamma_mg
 reg(7) = 0 !eta_gv /verticalily
 reg(8) = 0 !eta_mg
-reg(9) = 1 !mu_gv /structural coupling
-reg(10) = 1 !mu_mg
+reg(9) = 1e3 !mu_gv /structural coupling
+reg(10) = 1e3 !mu_mg
 dip = -45 !degree / only apply with gamma different if zero  !Positive from east to north.
 strike = 0 !degree  !Positive from north to west.
 !*************************
 
 ! STOP CONDITIONS
-num_iters = 50
+num_iters = 30
 err0 = 0.1 !% of model total variation for each iteration
 !*************************
 
@@ -55,29 +55,27 @@ err0 = 0.1 !% of model total variation for each iteration
 
 ! ANOMALIES 
 call readdata(xobs,yobs,zobs_gv,zobs_mg,d_gv,d_mg,stdevd_gv,stdevd_mg)
-
 m = size(d_gv)
 print*, "Total number of data: ", size(d_gv)
 
-! overwrite default values of data standard deviation
+! overwrite default values of DATA STANDARD DEVIATION
 stdevd_gv = 0.02*( maxval(d_gv)-minval(d_gv) ) !2% flexibility to fit the data
 stdevd_mg = 0.02*( maxval(d_mg)-minval(d_mg) )
 
 ! MODEL DIMENSIONS
 call readmodel(xcell,ycell,zcell,m_gv,m_mg)
-
 n = size(m_gv)
 print*, "Total number of parameters: ", n
+
+! overwrite default values of INITIAL MODEL 
+m_gv = 0 !Homogeneous distribution of initial parameters
+m_mg = 0
 
 ! MODEL STANDARD DEVIATION
 nx = 20 ; ny = 20 ; nz = 10 ; step = 50 !meters
 allocate( stdevm_gv(n), stdevm_mg(n) )
 call model1D(nx,ny,nz,1,stdevm_gv)
 call model1D(nx,ny,nz,1,stdevm_mg)
-
-! INITIAL MODEL 
-m_gv = 0 !Homogeneous distribution of initial parameters
-m_mg = 0
 
 ! A-PRIORI MODEL 
 allocate( mapr_gv(n), mapr_mg(n) )
@@ -104,8 +102,8 @@ TYPE = 1
 
 !Code version of inversion is defined for variable TYPE
 ! = 1: CPU version.
-! = 2: GPU version.
-! = 3: CPU/GPU version.
+! = 2: GPU version. /Only available using gram_joint_inversion.cuf module
+! = 3: CPU/GPU version. /Only available using gram_joint_inversion.cuf module
 ! = 0: no inversion, only input data read test.
 !***********************************************************************************************************************************
 call cpu_time(start0)
@@ -115,15 +113,19 @@ if (TYPE == 1) then
                       d_mg,stdevd_mg,m_mg,stdevm_mg,mapr_mg,A_mg,reg,dip,strike,num_iters,err0)
 
 elseif (TYPE == 2) then
-      call jointGramGPU(m,n,xobs,yobs,zobs_gv,zobs_mg,xcell,ycell,zcell,d_gv,stdevd_gv,m_gv,stdevm_gv,mapr_gv,A_gv, &
-                        d_mg,stdevd_mg,m_mg,stdevm_mg,mapr_mg,A_mg,reg,dip,strike,num_iters,err0)
+      !call jointGramGPU(m,n,xobs,yobs,zobs_gv,zobs_mg,xcell,ycell,zcell,d_gv,stdevd_gv,m_gv,stdevm_gv,mapr_gv,A_gv, &
+      !                  d_mg,stdevd_mg,m_mg,stdevm_mg,mapr_mg,A_mg,reg,dip,strike,num_iters,err0)
 
 elseif (TYPE == 3) then
-      call jointGramCPUGPU(m,n,xobs,yobs,zobs_gv,zobs_mg,xcell,ycell,zcell,d_gv,stdevd_gv,m_gv,stdevm_gv,mapr_gv,A_gv, &
-                        d_mg,stdevd_mg,m_mg,stdevm_mg,mapr_mg,A_mg,reg,dip,strike,num_iters,err0)
+      !call jointGramCPUGPU(m,n,xobs,yobs,zobs_gv,zobs_mg,xcell,ycell,zcell,d_gv,stdevd_gv,m_gv,stdevm_gv,mapr_gv,A_gv, &
+      !                  d_mg,stdevd_mg,m_mg,stdevm_mg,mapr_mg,A_mg,reg,dip,strike,num_iters,err0)
 
 elseif (TYPE == 0) then
       PRINT*, "Test input data"
+      print *, "d_gv", d_gv(1:5)
+      print *, "m_gv", m_gv(1:5)
+      print *, "A_gv:", A_gv(1:5,1:5)
+
 else 
       PRINT*, 'The inversion type was wrongly selected, please choose an appropriate TYPE'
 end if
@@ -159,8 +161,8 @@ write(13,*) 'strike =', strike
 write(13,*) ' '
 write(13,*) 'StdDeviation gv data = 2% rango de anomalia'
 write(13,*) 'StdDeviation mg data = 2% rango de anomalia'
-write(13,*) 'StdDeviation gv model = 1 todo modelo y 0.3 para cima del dominio gr/cm3 *MANUAL'
-write(13,*) 'StdDeviation mg model = 1 todo modelo y 0.3 para cima del dominio A/m  *MANUAL'
+write(13,*) 'StdDeviation gv model = 1 todo modelo y 0.3 para cima del dominio gr/cm3 *MANUALLY setup in model1D subroutine'
+write(13,*) 'StdDeviation mg model = 1 todo modelo y 0.3 para cima del dominio A/m  *MANUALLY setup in model1D subroutine'
 write(13,*) ' '
 write(13,*) 'Max Iterations Joint Inversion =',num_iters
 write(13,*) 'Stop Condition, % Convergence less than', err0
