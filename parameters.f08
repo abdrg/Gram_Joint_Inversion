@@ -5,8 +5,9 @@ program parameters
 !***********************************************************************************************************************************
 
 use iso_fortran_env , dp => real64
+use auxiliar
+use gram_joint_inversion_CPU
 !use gram_joint_inversion 
-use gram_joint_inversion_host
 
 implicit none
 
@@ -101,9 +102,9 @@ CLOSE(UNIT=2)
 TYPE = 1
 
 !Code version of inversion is defined for variable TYPE
-! = 1: CPU version.
-! = 2: GPU version. /Only available using gram_joint_inversion.cuf module
-! = 3: CPU/GPU version. /Only available using gram_joint_inversion.cuf module
+! = 1: CPU version. /Available using gram_joint_inversion_CPU and gram_joint_inversion modules
+! = 2: GPU version. /Only available using gram_joint_inversion module
+! = 3: CPU/GPU version. /Only available using gram_joint_inversion module
 ! = 0: no inversion, only input data read test.
 !***********************************************************************************************************************************
 call cpu_time(start0)
@@ -173,3 +174,4 @@ close(unit=13)
 !***********************************************************************************************************************************
 
 end program parameters
+
