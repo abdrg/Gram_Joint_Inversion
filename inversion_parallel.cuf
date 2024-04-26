@@ -1,0 +1,4389 @@
+module inversion_parallel
+! Contiene subrutinas para hacer modelado inverso de datos gravimétricos inverse_gv
+! y magnéticos inverse_mg en paralelo utilizando CUDA Fortran.
+
+! Autor: Abraham Del Razo, IPICyT. Oct 2022
+! Mail: abraham.delrazo@ipicyt.edu.mx
+!*******************************************************************************
+
+contains
+
+!*******************************************************************************
+!Parametros de funciones cuBLAS
+            !istat = cublasDdot(h, n, x_d, incx, y_d, incy, res)
+            !istat = cublasDgemv(h, CUBLAS_OP_N, m, n, ALPHA, a_d, lda, b_d, incx, BETA, c_d, incy)
+            !istat = cublasDgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, m, n, k, ALPHA, a_d, lda, b_d, ldb, BETA, c_d, ldc)
+            !if (istat .ne. 0) print *,"cublasDgemv_v2 returned ",istat
+
+!*******************************************************************************
+subroutine separateInv(m,n,xobs,yobs,zobs_gv,zobs_mg,xcell,ycell,zcell,d_gv,stdevd_gv,m_gv,stdevm_gv,mapr_gv,A_gv, &
+                       d_mg,stdevd_mg,m_mg,stdevm_mg,mapr_mg,A_mg,param_reg,dip,strike,num_iters,err0)
+! Subrutina que calcula inversion conjunta de dos modelos gravimétrico y magnético
+! considerando similitud estructural evaluada por gradientes cruzados implementada mediante el enfoque Gramiano.
+
+use iso_fortran_env , dp => real64
+implicit none
+
+integer, value :: m, n 
+integer, intent(in) :: num_iters
+real, intent(in) :: err0, dip, strike
+real, dimension(10) :: param_reg
+!real, intent(in), dimension(nx*ny) :: zobs_gv, zobs_mg
+!real, intent(in), dimension(nx*ny) :: d_gv, d_mg, stdevd_gv, stdevd_mg
+!real, intent(in), dimension(nx*ny*nz) :: m_gv, m_mg, mapr_gv, mapr_mg, stdevm_gv, stdevm_mg
+!real(dp), intent(in), dimension(nx*ny,nx*ny*nz) :: A_gv, A_mg
+real, allocatable, dimension (:) :: xobs, yobs, zobs_gv, zobs_mg, xcell, ycell, zcell
+real, allocatable, dimension(:) :: d_gv, d_mg, stdevd_gv, stdevd_mg, m_gv, m_mg, mapr_gv, mapr_mg, stdevm_gv, stdevm_mg
+real(dp), allocatable, dimension(:,:) :: A_gv, A_mg
+
+real(dp), allocatable, dimension(:,:) :: dx, dy, dz
+real(dp), allocatable, dimension(:,:) :: opL, opM, opL2, opM2, opN2
+
+real, allocatable, dimension(:,:) :: aL2, gM2, eN2
+real, allocatable, dimension(:,:) :: bWm2, Wd2, ATWd2, ATWd2A
+real(dp), dimension(n,n) :: Ia_gv, Ia_mg
+real(dp), dimension(2*n) :: Ib
+
+real(dp), allocatable, dimension(:) :: I_new, I, Iconj_new, Iconj, kn_2a
+real(dp) :: kn_1, kn_2b, kn
+real :: Am(2*m), dr(2*m), m_n(2*n), m_new(2*n)
+
+real :: conv_gv, conv_mg, rms_gv, rms_mg
+real :: Wd_gv(m), Wd_mg(m)
+integer :: ii, jj, kk
+character(len=42) :: filename00, filename1, filename2, filename3, filename4
+
+
+!*****************************************
+allocate ( dx(n,n),dy(n,n),dz(n,n),opL(n,n),opM(n,n),opL2(n,n),opM2(n,n),opN2(n,n) )
+
+!matrices para derivadas
+OPEN(UNIT=3, FILE="input_dx.dat", ACTION="read", FORM="unformatted")
+READ(3) dx
+CLOSE(UNIT=3)
+
+OPEN(UNIT=4, FILE="input_dy.dat", ACTION="read", FORM="unformatted")
+READ(4) dy
+CLOSE(UNIT=4)
+
+OPEN(UNIT=5, FILE="input_dz.dat", ACTION="read", FORM="unformatted")
+READ(5) dz
+CLOSE(UNIT=5)
+
+!Operador Suavidad
+OPEN(UNIT=6, FILE="input_Lapl.dat", ACTION="read", FORM="unformatted")
+READ(6) opL
+CLOSE(UNIT=6)
+opL2 = MATMUL(transpose(opL),opL)
+
+!Operador variacion horizontal total
+opM = dx*cos(dip)*cos(strike) + dy*cos(dip)*sin(strike) + dz*sin(dip)
+opM2 = MATMUL(transpose(opM),opM)
+
+!Operador variacion vertical
+!opN = dz
+opN2 = MATMUL(transpose(dz),dz)
+
+deallocate(opL,opM)
+
+
+!***********************
+!para gv
+allocate ( aL2(n,n),gM2(n,n),eN2(n,n),bWm2(n,n),Wd2(m,m),ATWd2(n,m),ATWd2A(n,n) )
+
+!Calculando matrices de pesos W
+do ii = 1, n
+  do jj = 1, n
+    if (ii == jj) then
+      bWm2(ii,jj) = param_reg(3) * (1/(stdevm_gv(ii)**2))
+    else
+      bWm2(ii,jj) = 0
+    end if
+  end do
+end do
+
+do ii = 1, m
+  do jj = 1, m
+    if (ii == jj) then
+      Wd2(ii,jj) = 1/(stdevd_gv(ii)**2)
+    else
+      Wd2(ii,jj) = 0
+    end if
+  end do
+end do
+!Recordar W**2 = C-1 = 1/(stdev**2) = 1/varianza (type=1). Pesos W son 1/stdev (type=2).
+Wd_gv = 1/stdevd_gv
+
+!operadores al cuadrado, pesados por parametros regularizadores
+aL2 = param_reg(1) * opL2
+gM2 = param_reg(5) * opM2
+eN2 = param_reg(7) * opN2
+
+ATWd2 = MATMUL(transpose(A_gv),Wd2)
+ATWd2A = MATMUL(ATWd2,A_gv)
+
+!Para calcular direccion de descenso I(m)
+Ia_gv = ATWd2A + aL2 + bWm2 + gM2 + eN2          
+Ib(1:n) = MATMUL(ATWd2,d_gv) + MATMUL(bWm2,mapr_gv)
+
+m_n(1:n) = m_gv
+deallocate(stdevm_gv,stdevd_gv,mapr_gv,m_gv)
+
+!**********************
+!para mg
+aL2=0; gM2=0; eN2=0; bWm2=0; Wd2=0; ATWd2=0; ATWd2A=0
+
+!Calculando matrices de pesos W
+do ii = 1, n
+  do jj = 1, n
+    if (ii == jj) then
+      bWm2(ii,jj) = param_reg(4) * (1/(stdevm_mg(ii)**2))
+    else
+      bWm2(ii,jj) = 0
+    end if
+  end do
+end do
+
+do ii = 1, m
+  do jj = 1, m
+    if (ii == jj) then
+      Wd2(ii,jj) = 1/(stdevd_mg(ii)**2)
+    else
+      Wd2(ii,jj) = 0
+    end if
+  end do
+end do
+!Recordar W**2 = C-1 = 1/(stdev**2) = 1/varianza (type=1). Pesos W son 1/stdev (type=2).
+Wd_mg = 1/stdevd_mg
+
+!operadores al cuadrado, pesados por parametros regularizadores
+aL2 = param_reg(2) * opL2
+gM2 = param_reg(6) * opM2
+eN2 = param_reg(8) * opN2
+
+ATWd2 = MATMUL(transpose(A_mg),Wd2)
+ATWd2A = MATMUL(ATWd2,A_mg)
+
+!Para calcular direccion de descenso I(m)
+Ia_mg = ATWd2A + aL2 + bWm2 + gM2 + eN2            
+Ib(n+1:2*n) = MATMUL(ATWd2,d_mg) + MATMUL(bWm2,mapr_mg)
+
+m_n(n+1:2*n) = m_mg
+deallocate(stdevm_mg,stdevd_mg,mapr_mg,m_mg)
+
+deallocate (opL2,opM2,opN2,aL2,gM2,eN2,bWm2,Wd2,ATWd2,ATWd2A)
+
+
+!**********************
+allocate ( I_new(2*n), I(2*n),Iconj(2*n),Iconj_new(2*n),kn_2a(2*n) )
+
+
+WRITE (filename00, '("output_misfit_jointGram.txt")' )
+OPEN(unit=16,file=filename00,status='unknown')
+WRITE(16,*) 'iteracion,convergencia%_gv,convergencia%_mg,RMS_gv,RMS_mg'
+
+!Método iterativo Gradiente Conjugado Regularizado RCG.
+conv_gv = 1e6 !error inicial (valor arbitrario grande)
+conv_mg = 1e6
+do ii = 1,num_iters,1
+      if ((conv_gv > err0).and.(conv_mg > err0)) then
+
+            !Calculando direccion de ascenso I(m) por descenso más pronunciado.
+            I_new(1:n) = MATMUL(Ia_gv,m_n(1:n)) - Ib(1:n)
+            I_new(n+1:2*n) = MATMUL(Ia_mg,m_n(n+1:2*n)) - Ib(n+1:2*n)
+
+            !Direccion de ascenso mediante gradientes conjugados.
+            if (ii == 1) then
+                  Iconj_new = I_new
+            else
+                  Iconj_new = I_new + ( (DOT_PRODUCT(I_new,I_new)/DOT_PRODUCT(I,I)) * Iconj )
+            end if
+
+
+            ! Tamaño de paso kn en la dirección I_n.
+            kn_1 = DOT_PRODUCT(Iconj_new,I_new)
+
+            kn_2a(1:n) = MATMUL(Ia_gv,Iconj_new(1:n))
+            kn_2a(n+1:2*n) = MATMUL(Ia_mg,Iconj_new(n+1:2*n))
+
+            kn_2b = DOT_PRODUCT(Iconj_new,kn_2a)
+
+            kn = kn_1 / kn_2b
+            
+            !Calculo m_new
+            m_new = m_n - (kn*Iconj_new) !array operation
+
+
+            ! Condicion de paro
+            !Convergencia
+            conv_gv = 100 * SQRT( SUM( ((m_new(1:n)-m_n(1:n))**2)/((m_n(1:n)**2)+1e-10) )/n )
+            conv_mg = 100 * SQRT( SUM( ((m_new(n+1:2*n)-m_n(n+1:2*n))**2)/((m_n(n+1:2*n)**2)+1e-10) )/n )
+            
+            !Actualizando variables para la siguiente iteración
+            m_n = m_new
+            I = I_new
+            Iconj = Iconj_new
+
+            !Obteniendo datos calculados
+            Am(1:m) = MATMUL(A_gv,m_new(1:n))
+            Am(m+1:2*m) = MATMUL(A_mg,m_new(n+1:2*n))
+
+            !RMS
+            dr(1:m) = Am(1:m) - d_gv !array operation
+            dr(m+1:2*m) = Am(m+1:2*m) - d_mg
+            dr(1:m) = Wd_gv * dr(1:m) !array operation
+            dr(m+1:2*m) = Wd_mg * dr(m+1:2*m)
+
+            rms_gv = DOT_PRODUCT(dr(1:m),dr(1:m))
+            rms_gv = SQRT(rms_gv/m)
+
+            rms_mg = DOT_PRODUCT(dr(m+1:2*m),dr(m+1:2*m))
+            rms_mg = SQRT(rms_mg/m)
+            
+            WRITE(16,'(I3,",",F16.4,",",F16.4,",",F12.4,",",F12.4)') ii,conv_gv,conv_mg,rms_gv,rms_mg
+
+
+            !Escribir resultados
+            ! Escribir archivos de modelos invertidos
+            WRITE (filename1, '("output_jointGram_gv_minv_iter",I2,".csv")' ) ii
+            OPEN(unit=9,file=filename1,status='unknown') !crear y escribir en archivo
+            WRITE(9,*) 'x[m],y[m],z[m],Density_Contrast[g/cm**3]'
+
+            WRITE (filename2, '("output_jointGram_mg_minv_iter",I2,".csv")' ) ii
+            OPEN(unit=10,file=filename2,status='unknown') !crear y escribir en archivo
+            WRITE(10,*) 'x[m],y[m],z[m],Magnetization_Contrast[A/m]'
+
+            do jj = 1,n,1
+                  WRITE(9,'(F10.3,",",F11.3,",",F10.3,",",E11.4)') xcell(jj),ycell(jj),zcell(jj),m_new(jj)
+                  WRITE(10,'(F10.3,",",F11.3,",",F10.3,",",E11.4)') xcell(jj),ycell(jj),zcell(jj),m_new(n+jj)
+            end do
+
+            CLOSE(unit=9)
+            CLOSE(unit=10)
+
+            ! Escribir archivos de datos calculados a partir de modelos invertidos
+            WRITE (filename3, '("output_jointGram_gv_anomaly_iter",I2,".csv")' ) ii
+            OPEN(unit=11,file=filename3,status='unknown') !crear y escribir en archivo
+            WRITE(11,*) 'x[m],y[m],z[m],Anomaly[mGal]'
+
+            WRITE (filename4, '("output_jointGram_mg_anomaly_iter",I2,".csv")' ) ii
+            OPEN(unit=12,file=filename4,status='unknown') !crear y escribir en archivo
+            WRITE(12,*) 'x[m],y[m],z[m],Anomaly[nT]'
+
+            do jj = 1,m,1
+                  WRITE(11,'(F10.3,",",F11.3,",",F10.3,",",E11.4)') xobs(jj),yobs(jj),zobs_gv(jj),Am(jj)
+                  WRITE(12,'(F10.3,",",F11.3,",",F10.3,",",E11.4)') xobs(jj),yobs(jj),zobs_mg(jj),Am(m+jj)
+            end do
+
+            CLOSE(unit=11)
+            CLOSE(unit=12)
+
+      end if
+end do
+
+CLOSE(unit=16)
+
+
+deallocate ( dx,dy,dz,I_new,I,Iconj,Iconj_new,kn_2a)
+deallocate ( A_gv,A_mg,d_gv,d_mg, xobs,yobs,zobs_gv,zobs_mg,xcell,ycell,zcell )
+
+return
+end subroutine separateInv
+!*******************************************************************************
+
+
+subroutine jointGramPL(num_iters,nx,ny,nz,step,err0,d_gv,elevd_gv,stdevd_gv,m_gv,stdevm_gv,mapr_gv,A_gv, &
+                          d_mg,elevd_mg,stdevd_mg,m_mg,stdevm_mg,mapr_mg,A_mg,param_reg,dip,strike,ciclo)
+
+! Subrutina que calcula inversion conjunta de dos modelos gravimétrico y magnético
+! considerando similitud estructural evaluada por gradientes cruzados implementada mediante el enfoque Gramiano.
+! Empleando cuBlas y arreglos concatenados (más uso de memoria en almacenamiento y multiplicaciones de matrices).
+
+use cudafor
+use cublas_v2
+use iso_fortran_env , dp => real64
+use auxiliar, only: cov, partialder, laplaciano, coord_voxel
+
+implicit none
+
+integer, intent(in) :: num_iters, nx, ny, nz, ciclo
+real, intent(in) :: step, err0, dip, strike
+real, dimension(10) :: param_reg
+real, intent(in), dimension(nx*ny) :: elevd_gv, elevd_mg
+!real, intent(in), dimension(nx*ny) :: d_gv, d_mg, stdevd_gv, stdevd_mg
+!real, intent(in), dimension(nx*ny*nz) :: m_gv, m_mg, mapr_gv, mapr_mg, stdevm_gv, stdevm_mg
+!real(dp), intent(in), dimension(nx*ny,nx*ny*nz) :: A_gv, A_mg
+real, allocatable, dimension(:) :: d_gv, d_mg, stdevd_gv, stdevd_mg, m_gv, m_mg, mapr_gv, mapr_mg, stdevm_gv, stdevm_mg
+real(dp), allocatable, dimension(:,:) :: A_gv, A_mg
+
+real, allocatable, dimension(:,:) :: Wd2_gv, Wd2_mg
+real, allocatable, dimension(:,:) :: Wm2_gv, Wm2_mg
+
+real(dp) :: d(2*nx*ny), Am(2*nx*ny), m_n(2*nx*ny*nz), dr(2*nx*ny), Wd(2*nx*ny), A(2*nx*ny,2*nx*ny*nz)
+real(dp), allocatable :: mapr(:), Wd2(:,:), bWm2(:,:)
+
+real(dp), allocatable, dimension(:,:) :: dx, dy, dz, opM, opN, opL, opM2, opN2, opL2
+
+real, allocatable, dimension(:,:) :: aL2, gM2, eN2
+real(dp), allocatable, dimension(:,:) :: ATWd2A
+real(dp), allocatable, dimension(:,:) :: ATWd2
+real(dp), dimension(2*nx*ny*nz, 2*nx*ny*nz) :: I_a
+real(dp), dimension(2*nx*ny*nz) :: I_b
+
+real(dp), device, allocatable, dimension(:) :: dxm1, dym1, dzm1, dxm2, dym2, dzm2, ter1, ter2, ter3, &
+                                                     diva, divb, divc, dive, ax, ay, az, bx, by, bz, cx, cy, cz, ex, ey, ez
+real(dp), device, allocatable, dimension(:) :: dxI1, dyI1, dzI1, dxI2, dyI2, dzI2, ter1J, ter2J
+
+real(dp), device, allocatable, dimension(:,:) :: dx_d, dy_d, dz_d, Ia_d(:,:)
+real(dp), device, allocatable, dimension(:) :: Ib_d, mIg, mJg, mn_d, I_new_d
+
+real(dp), dimension(2*nx*ny*nz) :: I_new, I, Iconj_new, Iconj, kn_2a, mJg_h
+real(dp) :: kn_1, kn_2b, kn_2c, kn
+real(dp), dimension(2*nx*ny*nz) :: m_new
+
+real, allocatable, dimension(:) :: x, y, z
+real :: xcell(nx), ycell(ny), zcell(nz), xobs(nx), yobs(ny)!, x(nx+1), y(ny+1), z(nz+1)
+character(len=42) :: filename00, filename1, filename2, filename3, filename4, filename5
+
+integer, value :: m, n
+integer, value :: ii, jj, aa, bb, cc, count
+real :: conv_gv, conv_mg, rms_gv, rms_mg
+
+!variables extra para paralelizar
+integer :: istat, n_blocks,n_threads, max_tpb
+type(cudaDeviceProp) :: prop
+real(dp) :: ALPHA=1.0 , BETA
+type(cublasHandle) :: h
+
+real :: start, finish
+
+!**********************
+!dimensiones de matrices y vectores
+m = nx*ny
+n = nx*ny*nz
+
+!reservar memoria para arreglos temporales !ya estaban reservadas desde parametros, para que sirva tiene que tener el mismo nombre en ambos modulos CREO
+!allocate ( d_gv(m),d_mg(m),stdevd_gv(m),stdevd_mg(m),m_gv(n),m_mg(n),mapr_gv(n),mapr_mg(n),stdevm_gv(n),stdevm_mg(n), &
+!A_gv(m,n,A_mg(m,n) )
+
+allocate ( Wd2_gv(m,m),Wd2_mg(m,m),Wm2_gv(n,n),Wm2_mg(n,n),mapr(2*n),Wd2(2*m,2*m),bWm2(2*n,2*n), &
+opM(n,n),opN(n,n),opL(n,n),opM2(n,n),opN2(n,n),opL2(n,n),aL2(2*n,2*n),gM2(2*n,2*n),eN2(2*n,2*n),ATWd2(2*n,2*m),ATWd2A(2*n,2*n), &
+dx(n,n),dy(n,n),dz(n,n),x(nx+1),y(ny+1),z(nz+1) )
+
+!Creando vectores, matrices y operadores concatenados
+d(1:m) = d_gv
+d(m+1:2*m) = d_mg
+
+m_n(1:n) = m_gv
+m_n(n+1:2*n) = m_mg
+
+mapr(1:n) = mapr_gv
+mapr(n+1:2*n) = mapr_mg
+
+A = 0
+A(1:m,1:n) = A_gv
+A(m+1:2*m,n+1:2*n) = A_mg
+
+!Obteniendo datos calculados
+Am = MATMUL(A,m_n)
+
+!Calculando matrices de pesos
+!Recordar W**2 = C-1 = 1/(stdev**2) = 1/varianza (type=1). Pesos W son 1/stdev (type=2).
+!subroutine cov(num,type,std_dev,covar)
+call cov(m,1,stdevd_gv,Wd2_gv)
+call cov(m,1,stdevd_mg,Wd2_mg)
+call cov(n,1,stdevm_gv,Wm2_gv)
+call cov(n,1,stdevm_mg,Wm2_mg)
+
+Wd(1:m) = 1/stdevd_gv
+Wd(m+1:2*m) = 1/stdevd_mg
+
+Wd2 = 0 !llenar matriz con ceros
+Wd2(1:m,1:m) = Wd2_gv
+Wd2(m+1:2*m,m+1:2*m) = Wd2_mg
+
+bWm2 = 0
+bWm2(1:n,1:n) = param_reg(3) * Wm2_gv
+bWm2(n+1:2*n,n+1:2*n) = param_reg(4) * Wm2_mg
+
+!***********************
+!matrices para derivadas
+call partialder(nx,ny,nz,step,'x',dx)
+call partialder(nx,ny,nz,step,'y',dy)
+call partialder(nx,ny,nz,step,'z',dz)
+
+!Operador variacion horizontal total
+opM = dx*cos(dip)*cos(strike) + dy*cos(dip)*sin(strike) + dz*sin(dip)
+opM2 = MATMUL(transpose(opM),opM)
+
+!Operador variacion vertical
+opN = dz
+opN2 = MATMUL(transpose(opN),opN)
+
+!Operador Suavidad
+!subroutine laplaciano(nx,ny,nz,step,L)
+call laplaciano(nx,ny,nz,step,opL)
+opL2 = MATMUL(transpose(opL),opL)
+
+!**********************
+!operadores al cuadrado, pesados por parametros regularizadores
+aL2(1:n,1:n) = param_reg(1) *opL2
+aL2(n+1:2*n,n+1:2*n) = param_reg(2) * opL2
+gM2(1:n,1:n) = param_reg(5) * opM2
+gM2(n+1:2*n,n+1:2*n) = param_reg(6) * opM2
+eN2(1:n,1:n) = param_reg(7) * opN2
+eN2(n+1:2*n,n+1:2*n) = param_reg(8) * opN2
+
+!**********************
+!Para calcular direccion de descenso I(m)
+ATWd2 = MATMUL(transpose(A),Wd2)
+ATWd2A = MATMUL(ATWd2,A)
+I_a = ATWd2A + aL2 + bWm2 + gM2 + eN2
+
+I_b = MATMUL(ATWd2,d) +  MATMUL(bWm2,mapr)
+
+!**********************
+!Para escribir resultados
+call coord_voxel(nx,ny,nz,step,x,y,z)
+! Crear puntos centro de celda.
+do aa = 1,nx,1
+  xcell(aa) = x(aa) + ( abs(x(aa+1)-x(aa))/2 )
+end do
+do bb = 1,ny,1
+  ycell(bb) = y(bb) + ( abs(y(bb+1)-y(bb))/2 )
+end do
+do cc = 1,nz,1
+  zcell(cc) = z(cc) - ( abs(z(cc+1)-z(cc))/2 )
+end do
+
+! Crear puntos de obseración a la mitad de cada celda.
+xobs = xcell
+yobs = ycell
+
+
+!**********************
+!Reservar memoria para arreglos en device
+allocate ( dx_d(n,n),dy_d(n,n),dz_d(n,n),Ia_d(2*n,2*n),Ib_d(2*n),mIg(2*n),mJg(2*n),mn_d(2*n),I_new_d(2*n) )
+!copiar arreglos a device
+dx_d = dx
+dy_d = dy
+dz_d = dz
+mn_d = m_n
+Ia_d = I_a
+Ib_d = I_b
+
+allocate ( dxm1(n),dym1(n),dzm1(n),dxm2(n),dym2(n),dzm2(n),ter1(n),ter2(n),ter3(n),diva(n),divb(n),divc(n),dive(n), &
+ax(n),ay(n),az(n),bx(n),by(n),bz(n),cx(n),cy(n),cz(n),ex(n),ey(n),ez(n), &
+dxI1(n),dyI1(n),dzI1(n),dxI2(n),dyI2(n),dzI2(n),ter1J(n),ter2J(n) )
+
+!**********************
+!liberar memoria para arreglos temporales en host.
+deallocate (d_gv,d_mg,stdevd_gv,stdevd_mg,m_gv,m_mg,mapr_gv,mapr_mg,stdevm_gv,stdevm_mg,A_gv,A_mg,Wd2_gv,Wd2_mg,Wm2_gv,Wm2_mg)
+deallocate (mapr,Wd2,bWm2,opM,opM2,opN,opN2,opL,opL2,aL2,gM2,eN2,ATWd2,ATWd2A,dx,dy,dz,x,y,z)
+
+!**********************
+WRITE (filename00, '("output_misfit_jointGram_c",I1,".txt")' ) ciclo
+OPEN(unit=16,file=filename00,status='unknown')
+WRITE(16,*) 'iteracion,convergencia%_gv,convergencia%_mg,RMS_gv,RMS_mg'
+
+!Método iterativo Gradiente Conjugado Regularizado RCG.
+conv_gv = 1e6 !error inicial (valor arbitrario grande)
+conv_mg = 1e6
+! Condicion de paro
+do ii = 1,num_iters,1 
+      if ((conv_gv >= err0).and.(conv_mg >= err0)) then
+
+            ! INICIAN CALCULOS EN GPU
+            istat = cublasCreate(h)
+            if (istat .ne. 0) print *,"cublasCreate returned ",istat
+            
+            !Evaluar eficiencia.
+            call cpu_time(start)
+            print*, 'Inician calculos en paralelo'
+
+            istat = cudaGetDeviceProperties(prop, 0)  ! Supongo que sólo tiene un GPU
+            max_tpb = prop%maxThreadsPerBlock
+            n_threads  = max_tpb
+            n_blocks  = (n/max_tpb) + 1
+
+            !Preparativos para calcular I(m).
+            !matrices de derivadas con laplaciano
+            !dxm1 = MATMUL(dx,m_n(1:n))
+            !dym1 = MATMUL(dy,m_n(1:n))
+            !dzm1 = MATMUL(dz,m_n(1:n))
+            !dxm2 = MATMUL(dx,m_n(n+1:2*n))
+            !dym2 = MATMUL(dy,m_n(n+1:2*n))
+            !dzm2 = MATMUL(dz,m_n(n+1:2*n))
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),mn_d(1:n),1,BETA,dxm1,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),mn_d(1:n),1,BETA,dym1,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),mn_d(1:n),1,BETA,dzm1,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),mn_d(n+1:2*n),1,BETA,dxm2,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),mn_d(n+1:2*n),1,BETA,dym2,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),mn_d(n+1:2*n),1,BETA,dzm2,1)
+
+
+            !Ig
+            !ter1 = (dxm1*dxm2)+(dym1*dym2)+(dzm1*dzm2) !producto interno nabla_m1,nabla_m2
+            !ax = ter1*dxm2 !array operation
+            !ay = ter1*dym2
+            !az = ter1*dzm2
+            !call kernel cuda fortran
+            call prod<<<n_blocks,n_threads>>>(dxm1,dxm2,ter1,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dym1,dym2,ter1,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(dzm1,dzm2,ter1,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(ter1,dxm2,ax,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter1,dym2,ay,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter1,dzm2,az,1.,0.)
+          
+            !ter2 = (dxm2**2) + (dym2**2) + (dzm2**2) !modulo cuadrado de m2
+            !bx = ter2*dxm1 
+            !by = ter2*dym1
+            !bz = ter2*dzm1
+            call prod<<<n_blocks,n_threads>>>(dxm2,dxm2,ter2,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dym2,dym2,ter2,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(dzm2,dzm2,ter2,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(ter2,dxm1,bx,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter2,dym1,by,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter2,dzm1,bz,1.,0.)
+            
+            !cx = ter1*dxm1
+            !cy = ter1*dym1
+            !cz = ter1*dzm1
+            call prod<<<n_blocks,n_threads>>>(ter1,dxm1,cx,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter1,dym1,cy,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter1,dzm1,cz,1.,0.)
+
+            !ter3 = (dxm1**2) + (dym1**2) + (dzm1**2) !modulo cuadrado de m1
+            !ex = ter3*dxm2
+            !ey = ter3*dym2
+            !ez = ter3*dzm2
+            call prod<<<n_blocks,n_threads>>>(dxm1,dxm1,ter3,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dym1,dym1,ter3,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(dzm1,dzm1,ter3,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(ter3,dxm2,ex,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter3,dym2,ey,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter3,dzm2,ez,1.,0.)
+
+            !diva = MATMUL(dx,ax) + MATMUL(dy,ay) + MATMUL(dz,az)
+            !divb = MATMUL(dx,bx) + MATMUL(dy,by) + MATMUL(dz,bz)
+            !divc = MATMUL(dx,cx) + MATMUL(dy,cy) + MATMUL(dz,cz)
+            !dive = MATMUL(dx,ex) + MATMUL(dy,ey) + MATMUL(dz,ez)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),ax,1,BETA,diva,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),ay,1,BETA,diva,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),az,1,BETA,diva,1)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),bx,1,BETA,divb,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),by,1,BETA,divb,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),bz,1,BETA,divb,1)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),cx,1,BETA,divc,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),cy,1,BETA,divc,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),cz,1,BETA,divc,1)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),ex,1,BETA,dive,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),ey,1,BETA,dive,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),ez,1,BETA,dive,1)
+
+            !mIg(1:n) = param_reg_d(9) * (diva - divb)
+            !mIg(n+1:2*n) = param_reg_d(10) * (divc - dive)
+            call sus<<<n_blocks,n_threads>>>(diva,divb,mIg(1:n),param_reg(9),0.)
+            call sus<<<n_blocks,n_threads>>>(divc,dive,mIg(n+1:2*n),param_reg(10),0.)
+            
+
+            !Calculando direccion de ascenso I(m) por descenso más pronunciado.
+            !I_new_d = mIg - Ib_d
+            n_blocks  = ((2*n)/max_tpb) + 1
+            call sus<<<n_blocks,n_threads>>>(mIg,Ib_d,I_new_d,1.,0.)
+            !I_new = MATMUL(I_a,m_n) + (mI_G - I_b)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(Ia_d,1),size(Ia_d,2),ALPHA,Ia_d,size(Ia_d,1),mn_d,1,BETA,I_new_d,1)
+
+            ! Bajar arreglos a host y subir separado para siguiente parte.
+            I_new = I_new_d !**Aqui se puede iniciar una segunda hebra, continuar con algunos calculos en host mientras GPU acaba la segunda parte.
+
+            !Reset variables temporales.
+            ax=0; ay=0; az=0; bx=0; by=0; bz=0; cx=0; cy=0; cz=0; ex=0; ey=0; ez=0
+            diva=0; divb=0; divc=0; dive=0
+
+            !Jg
+            !dxI1 = MATMUL(dx,I_new(1:n))
+            !dyI1 = MATMUL(dy,I_new(1:n))
+            !dzI1 = MATMUL(dz,I_new(1:n))
+            !dxI2 = MATMUL(dx,I_new(n+1:2*n))
+            !dyI2 = MATMUL(dy,I_new(n+1:2*n))
+            !dzI2 = MATMUL(dz,I_new(n+1:2*n))
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),I_new_d(1:n),1,BETA,dxI1,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),I_new_d(1:n),1,BETA,dyI1,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),I_new_d(1:n),1,BETA,dzI1,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),I_new_d(n+1:2*n),1,BETA,dxI2,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),I_new_d(n+1:2*n),1,BETA,dyI2,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),I_new_d(n+1:2*n),1,BETA,dzI2,1)
+
+            !ter1J = (dxm2*dxI1)+(dym2*dyI1)+(dzm2*dzI1) !producto interno nabla_m2,nabla_I
+            !ax = ter1J*dxm2
+            !ay = ter1J*dym2
+            !az = ter1J*dzm2
+            !call kernel cuda fortran
+            n_blocks  = (n/max_tpb) + 1
+            call prod<<<n_blocks,n_threads>>>(dxm2,dxI1,ter1J,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dym2,dyI1,ter1J,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(dzm2,dzI1,ter1J,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(ter1J,dxm2,ax,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter1J,dym2,ay,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter1J,dzm2,az,1.,0.)           
+
+            !bx = ter2*dxI1
+            !by = ter2*dyI1
+            !bz = ter2*dzI1
+            call prod<<<n_blocks,n_threads>>>(ter2,dxI1,bx,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter2,dyI1,by,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter2,dzI1,bz,1.,0.)
+            
+            !ter2J = (dxm1*dxI2)+(dym1*dyI2)+(dzm1*dzI2) !producto interno nabla_m1,nabla_I
+            !cx = ter2J*dxm1
+            !cy = ter2J*dym1
+            !cz = ter2J*dzm1
+            call prod<<<n_blocks,n_threads>>>(dxm1,dxI2,ter2J,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dym1,dyI2,ter2J,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(dzm1,dzI2,ter2J,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(ter2J,dxm1,cx,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter2J,dym1,cy,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter2J,dzm1,cz,1.,0.) 
+
+            !ex = ter3*dxI2
+            !ey = ter3*dyI2
+            !ez = ter3*dzI2
+            call prod<<<n_blocks,n_threads>>>(ter3,dxI2,ex,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter3,dyI2,ey,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter3,dzI2,ez,1.,0.) 
+            
+            !divaJ = MATMUL(dx,axJ) + MATMUL(dy,ayJ) + MATMUL(dz,azJ)
+            !divbJ = MATMUL(dx,bxJ) + MATMUL(dy,byJ) + MATMUL(dz,bzJ)
+            !divcJ = MATMUL(dx,cxJ) + MATMUL(dy,cyJ) + MATMUL(dz,czJ)
+            !diveJ = MATMUL(dx,exJ) + MATMUL(dy,eyJ) + MATMUL(dz,ezJ)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),ax,1,BETA,diva,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),ay,1,BETA,diva,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),az,1,BETA,diva,1)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),bx,1,BETA,divb,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),by,1,BETA,divb,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),bz,1,BETA,divb,1)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),cx,1,BETA,divc,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),cy,1,BETA,divc,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),cz,1,BETA,divc,1)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),ex,1,BETA,dive,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),ey,1,BETA,dive,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),ez,1,BETA,dive,1)
+
+            !mJg(1:n) = param_reg_d(9) * (divaJ - divbJ)
+            !mJg(n+1:2*n) = param_reg_d(10) * (divcJ - diveJ)
+            n_blocks  = (n/max_tpb) + 1
+            call sus<<<n_blocks,n_threads>>>(diva,divb,mJg(1:n),param_reg(9),0.)
+            call sus<<<n_blocks,n_threads>>>(divc,dive,mJg(n+1:2*n),param_reg(10),0.)
+
+            ! Bajar arreglos a host
+            mJg_h = mJg
+
+            ! TERMINAN CALCULOS EN GPU
+            istat = cublasDestroy(h)
+            if (istat .ne. 0) print *,"cublasDestroy returned ",istat
+
+            ! Evaluar eficiencia.
+            call cpu_time(finish)
+            OPEN(unit=0,file='output_time.txt',status='old')
+            WRITE(0,*) 'Execution time: parallel part jointGram =', (finish-start), 'seg =', (finish-start)/60, 'min'
+
+
+            !Direccion de ascenso mediante gradientes conjugados.
+            if (ii == 1) then
+                  Iconj_new = I_new
+            else
+                  Iconj_new = I_new + ( (DOT_PRODUCT(I_new,I_new)/DOT_PRODUCT(I,I)) * Iconj )
+            end if
+
+
+            ! Tamaño de paso kn en la dirección I(m).
+            kn_1 = DOT_PRODUCT(Iconj_new,I_new)
+            kn_2a = MATMUL(I_a,Iconj_new)
+            kn_2b = DOT_PRODUCT(Iconj_new,kn_2a)
+            kn_2c = DOT_PRODUCT(Iconj_new,mJg_h)
+
+            kn = kn_1 / (kn_2b + kn_2c +1e-10)  !para evitar divisiones por cero
+
+            !Calculo m_new
+            m_new = m_n - (kn*Iconj_new) !array operation
+
+            !Subir arreglos a device para siguiente iteracion
+            mn_d = m_new
+
+
+            !Condicion de paro
+            !Convergencia
+            conv_gv = 100 * SQRT( SUM( ((m_new(1:n)-m_n(1:n))**2)/((m_n(1:n)**2)+1e-10) )/n )
+            conv_mg = 100 * SQRT( SUM( ((m_new(n+1:2*n)-m_n(n+1:2*n))**2)/((m_n(n+1:2*n)**2)+1e-10) )/n )
+
+            !Actualizando variables para la siguiente iteración
+            m_n = m_new
+            I = I_new
+            Iconj = Iconj_new
+
+            
+            !Obteniendo datos calculados
+            Am = MATMUL(A,m_new)
+
+            !RMS
+            dr = Am - d !array operation
+            dr = Wd * dr !array operation
+            rms_gv = DOT_PRODUCT(dr(1:m),dr(1:m))
+            rms_gv = SQRT(rms_gv/m)
+            rms_mg = DOT_PRODUCT(dr(m+1:2*m),dr(m+1:2*m))
+            rms_mg = SQRT(rms_mg/m)
+
+            WRITE(16,'(I3,",",F14.4,",",F14.4,",",F10.4,",",F10.4)') ii,conv_gv,conv_mg,rms_gv,rms_mg
+
+            
+            !Escribir resultados
+            ! Escribir archivos de modelos invertidos
+            WRITE (filename1, '("output_jointGram_gv_minv_c",I1,"_iter",I1,".csv")' ) ciclo, ii
+            OPEN(unit=9,file=filename1,status='unknown') !crear y escribir en archivo
+            WRITE(9,*) 'x[km],y[km],z[km],Density_Contrast[g/cm**3]'
+
+            WRITE (filename2, '("output_jointGram_mg_minv_c",I1,"_iter",I1,".csv")' ) ciclo, ii
+            OPEN(unit=10,file=filename2,status='unknown') !crear y escribir en archivo
+            WRITE(10,*) 'x[km],y[km],z[km],Magnetization_Contrast[A/m]'
+
+            count = 0
+            do aa = 1,nx,1
+                  do bb = 1,ny,1
+                        do cc = 1,nz,1
+                              count = count + 1
+                              WRITE(9,'(F10.3,",",F11.3,",",F10.3,",",E11.4)') xcell(aa),ycell(bb),zcell(cc),m_new(count)
+                              WRITE(10,'(F10.3,",",F11.3,",",F10.3,",",E11.4)') xcell(aa),ycell(bb),zcell(cc),m_new(n+count)
+            
+                        end do
+                  end do
+            end do
+
+            CLOSE(unit=9)
+            CLOSE(unit=10)
+
+            ! Escribir archivos de datos calculados a partir de modelos invertidos
+            WRITE (filename3, '("output_jointGram_gv_anomaly_c",I1,"_iter",I1,".csv")' ) ciclo, ii
+            OPEN(unit=11,file=filename3,status='unknown') !crear y escribir en archivo
+            WRITE(11,*) 'x[km],y[km],z[km],g[mGal]'
+
+            WRITE (filename4, '("output_jointGram_mg_anomaly_c",I1,"_iter",I1,".csv")' ) ciclo, ii
+            OPEN(unit=12,file=filename4,status='unknown') !crear y escribir en archivo
+            WRITE(12,*) 'x[km],y[km],z[km],m[nT]'
+
+            count = 0
+            do aa = 1,nx,1
+                  do bb = 1,ny,1
+                        count = count + 1
+                        WRITE(11,'(F10.3,",",F11.3,",",F10.3,",",E11.4)') xobs(aa),yobs(bb),elevd_gv(count),Am(count)
+                        WRITE(12,'(F10.3,",",F11.3,",",F10.3,",",E11.4)') xobs(aa),yobs(bb),elevd_mg(count),Am(m+count)
+                  end do
+            end do
+
+            CLOSE(unit=11)
+            CLOSE(unit=12)
+            
+            ! Evaluar eficiencia.
+            call cpu_time(finish)
+            OPEN(unit=0,file='output_time.txt',status='old')
+            WRITE(0,*) 'Execution time: serial part jointGram =', (finish-start), 'seg =', (finish-start)/60, 'min'
+
+      end if
+end do
+
+CLOSE(unit=16)
+
+
+deallocate ( dxm1,dym1,dzm1,dxm2,dym2,dzm2,ter1,ter2,ter3,diva,divb,divc,dive,ax,ay,az,bx,by,bz,cx,cy,cz,ex,ey,ez, &
+             dxI1,dyI1,dzI1,dxI2,dyI2,dzI2,ter1J,ter2J )
+deallocate ( dx_d,dy_d,dz_d,Ia_d,Ib_d,mIg,mJg,mn_d,I_new_d)
+
+!close(unit=0)
+
+return
+end subroutine jointGramPL
+!*******************************************************************************
+
+
+subroutine jointGramPL2(m,n,nx,ny,nz,step,xobs,yobs,zobs_gv,zobs_mg,xcell,ycell,zcell,d_gv,stdevd_gv,m_gv,stdevm_gv,mapr_gv,A_gv, &
+                        d_mg,stdevd_mg,m_mg,stdevm_mg,mapr_mg,A_mg,param_reg,dip,strike,num_iters,err0,ciclo)
+! Subrutina que calcula inversion conjunta de dos modelos gravimétrico y magnético
+! considerando similitud estructural evaluada por gradientes cruzados implementada mediante el enfoque Gramiano.
+! Empleando cuBlas y arreglos de matrices por separado para cada tipo de dato, disminuye uso de memoria y tiempo de multiplicacion de matrices.
+
+use cudafor
+use cublas_v2
+use iso_fortran_env , dp => real64
+use auxiliar, only: cov, partialder, laplaciano
+
+implicit none
+
+integer, value :: m, n
+integer, intent(in) :: num_iters, nx, ny, nz, ciclo
+real, intent(in) :: step, err0, dip, strike
+real, dimension(10) :: param_reg
+!real, intent(in), dimension(nx*ny) :: zobs_gv, zobs_mg
+!real, intent(in), dimension(nx*ny) :: d_gv, d_mg, stdevd_gv, stdevd_mg
+!real, intent(in), dimension(nx*ny*nz) :: m_gv, m_mg, mapr_gv, mapr_mg, stdevm_gv, stdevm_mg
+!real(dp), intent(in), dimension(nx*ny,nx*ny*nz) :: A_gv, A_mg
+real, allocatable, dimension (:) :: xobs, yobs, zobs_gv, zobs_mg, xcell, ycell, zcell
+real, allocatable, dimension(:) :: d_gv, d_mg, stdevd_gv, stdevd_mg, m_gv, m_mg, mapr_gv, mapr_mg, stdevm_gv, stdevm_mg
+real(dp), allocatable, dimension(:,:) :: A_gv, A_mg
+
+real, allocatable, dimension(:,:) :: Wd2_gv, Wd2_mg
+real, allocatable, dimension(:,:) :: Wm2_gv, Wm2_mg
+real, allocatable :: bWm2(:,:)
+
+real(dp), dimension(n,n) :: dx, dy, dz
+real(dp), allocatable, dimension(:,:) :: opM, opN, opL, opM2, opN2, opL2
+real, allocatable, dimension(:,:) :: aL2, gM2, eN2
+
+real(dp), allocatable, dimension(:,:) :: ATWd2_gv, ATWd2_mg
+real(dp), allocatable, dimension(:,:) :: ATWd2A_gv, ATWd2A_mg
+real(dp), dimension(n,n) :: Ia_gv, Ia_mg
+
+
+real(dp), device, allocatable, dimension(:) :: dxm1, dym1, dzm1, dxm2, dym2, dzm2, ter1, ter2, ter3, &
+                                                     diva, divb, divc, dive, ax, ay, az, bx, by, bz, cx, cy, cz, ex, ey, ez
+real(dp), device, allocatable, dimension(:) :: dxI1, dyI1, dzI1, dxI2, dyI2, dzI2, ter1J, ter2J
+
+real(dp), device, allocatable, dimension(:,:) :: dx_d, dy_d, dz_d, Ia_gv_d, Ia_mg_d
+real(dp), device, allocatable, dimension(:) :: mn_d, Ib_d, mIg, mJg, I_new_d
+
+real(dp), dimension(2*n) :: I_new, I, Iconj_new, Iconj, kn_2a, mJg_h, Ib
+real(dp) :: kn_1, kn_2b, kn_2c, kn
+real(dp), dimension(2*n) :: m_new
+real(dp) :: Am(2*m), dr(2*m), m_n(2*n)
+
+real :: conv_gv, conv_mg, rms_gv, rms_mg
+real :: Wd_gv(m), Wd_mg(m)
+integer, value :: ii, jj, kk
+character(len=42) :: filename00, filename1, filename2, filename3, filename4
+real :: start, finish
+
+!variables extra para paralelizar
+type(cublasHandle) :: h
+integer :: istat,n_threads, n_blocks
+type(cudaDeviceProp) :: prop
+real(dp) :: ALPHA=1.0 , BETA=0.0
+
+!Evaluar eficiencia.
+call cpu_time(start)
+print*, 'Inician calculos en CPU'
+
+
+!**********************
+!reservar memoria para arreglos temporales
+!allocate ( d_gv(m),d_mg(m),mapr_gv(n),mapr_mg(n),m_gv(n),m_mg(n),stdevd_gv(m),stdevd_mg(m),stdevm_gv(n),stdevm_mg(n), &
+!          A_gv(m,n),A_mg(m,n),xcell(n), ycell(n), zcell(n), xobs(m), yobs(m), zobs_gv(m), zobs_mg(m) )
+
+allocate ( Wd2_gv(m,m),Wd2_mg(m,m),Wm2_gv(n,n),Wm2_mg(n,n),bWm2(n,n), &
+           opM(n,n),opN(n,n),opL(n,n),opM2(n,n),opN2(n,n),opL2(n,n),aL2(n,n),gM2(n,n),eN2(n,n), &
+           ATWd2_gv(n,m),ATWd2A_gv(n,n),ATWd2_mg(n,m),ATWd2A_mg(n,n) )
+
+
+!matrices para derivadas
+call partialder(nx,ny,nz,step,'x',dx)
+call partialder(nx,ny,nz,step,'y',dy)
+call partialder(nx,ny,nz,step,'z',dz)
+
+!Operador Suavidad
+call laplaciano(nx,ny,nz,step,opL)
+opL2 = MATMUL(transpose(opL),opL)
+
+!Operador variacion horizontal total
+opM = dx*cos(dip)*cos(strike) + dy*cos(dip)*sin(strike) + dz*sin(dip)
+opM2 = MATMUL(transpose(opM),opM)
+
+!Operador variacion vertical
+opN = dz
+opN2 = MATMUL(transpose(opN),opN)
+
+
+!***********************
+!para gv
+m_n(1:n) = m_gv
+!Obteniendo datos calculados
+Am(1:m) = MATMUL(A_gv,m_gv)
+
+!Recordar W**2 = C-1 = 1/(stdev**2) = 1/varianza (type=1). Pesos W son 1/stdev (type=2).
+Wd_gv = 1/stdevd_gv
+!Calculando matrices de pesos
+!subroutine cov(num,type,std_dev,covar)
+call cov(m,1,stdevd_gv,Wd2_gv)
+call cov(n,1,stdevm_gv,Wm2_gv)
+!operadores al cuadrado, pesados por parametros regularizadores
+bWm2 = param_reg(3) * Wm2_gv
+aL2 = param_reg(1) * opL2
+gM2 = param_reg(5) * opM2
+eN2 = param_reg(7) * opN2
+
+!Para calcular direccion de descenso I(m)
+ATWd2_gv = MATMUL(transpose(A_gv),Wd2_gv)
+ATWd2A_gv = MATMUL(ATWd2_gv,A_gv)
+
+Ia_gv = ATWd2A_gv + aL2 + bWm2 + gM2 + eN2            
+Ib(1:n) = MATMUL(ATWd2_gv,d_gv) + MATMUL(bWm2,mapr_gv)
+!print*, Ia_gv(1:10,1:2)
+
+!**********************
+!para mg
+m_n(n+1:2*n) = m_mg
+!Obteniendo datos calculados
+Am(m+1:2*m) = MATMUL(A_mg,m_mg)
+
+!Recordar W**2 = C-1 = 1/(stdev**2) = 1/varianza (type=1). Pesos W son 1/stdev (type=2).
+Wd_mg = 1/stdevd_mg
+!Calculando matrices de pesos
+!subroutine cov(num,type,std_dev,covar)
+call cov(m,1,stdevd_mg,Wd2_mg)
+call cov(n,1,stdevm_mg,Wm2_mg)
+!operadores al cuadrado, pesados por parametros regularizadores
+bWm2 = param_reg(4) * Wm2_mg
+aL2 = param_reg(2) * opL2
+gM2 = param_reg(6) * opM2
+eN2 = param_reg(8) * opN2
+
+!Para calcular direccion de descenso I(m)
+ATWd2_mg = MATMUL(transpose(A_mg),Wd2_mg)
+ATWd2A_mg = MATMUL(ATWd2_mg,A_mg)
+
+Ia_mg = ATWd2A_mg + aL2 + bWm2 + gM2 + eN2            
+Ib(n+1:2*n) = MATMUL(ATWd2_mg,d_mg) + MATMUL(bWm2,mapr_mg)
+
+
+!**********************
+!Reservar memoria para arreglos en device
+allocate ( dx_d(n,n),dy_d(n,n),dz_d(n,n),mn_d(2*n),Ia_gv_d(n,n),Ia_mg_d(n,n),Ib_d(2*n),mIg(2*n),mJg(2*n),I_new_d(2*n) )
+!copiar arreglos a device
+dx_d = dx
+dy_d = dy
+dz_d = dz
+mn_d = m_n
+Ia_gv_d = Ia_gv
+Ia_mg_d = Ia_mg
+Ib_d = Ib
+
+allocate ( dxm1(n),dym1(n),dzm1(n),dxm2(n),dym2(n),dzm2(n),ter1(n),ter2(n),ter3(n),diva(n),divb(n),divc(n),dive(n), &
+ax(n),ay(n),az(n),bx(n),by(n),bz(n),cx(n),cy(n),cz(n),ex(n),ey(n),ez(n), &
+dxI1(n),dyI1(n),dzI1(n),dxI2(n),dyI2(n),dzI2(n),ter1J(n),ter2J(n) )
+
+!**********************
+!liberar memoria para arreglos temporales
+deallocate (m_gv,m_mg,mapr_gv,mapr_mg,stdevd_gv,stdevd_mg,stdevm_gv,stdevm_mg)!d_gv,d_mg,A_gv,A_mg)
+deallocate (Wd2_gv,Wd2_mg,Wm2_gv,Wm2_mg,bWm2,opL,opL2,opM,opM2,opN,opN2,aL2,gM2,eN2,ATWd2_gv,ATWd2A_gv,ATWd2_mg,ATWd2A_mg)
+
+!**********************
+WRITE (filename00, '("output_misfit_jointGram_c",I1,".txt")' ) ciclo
+OPEN(unit=16,file=filename00,status='unknown')
+WRITE(16,*) 'iteracion,convergencia%_gv,convergencia%_mg,RMS_gv,RMS_mg'
+
+!Método iterativo Gradiente Conjugado Regularizado RCG.
+conv_gv = 1e6 !error inicial (valor arbitrario grande)
+conv_mg = 1e6
+! Condicion de paro
+do ii = 1,num_iters,1
+      if ((conv_gv > err0).and.(conv_mg > err0)) then
+
+            ! INICIAN CALCULOS EN GPU
+            istat = cublasCreate(h)
+            if (istat .ne. 0) print *,"cublasCreate returned ",istat
+            
+            !Evaluar eficiencia.
+            call cpu_time(start)
+            print*, 'Inician calculos en GPU iteracación: ', ii
+
+            istat = cudaGetDeviceProperties(prop, 0)  ! Supongo que sólo tiene un GPU
+            n_threads = prop%maxThreadsPerBlock
+            n_blocks  = ceiling(real(n)/n_threads)
+
+            !Preparativos para calcular I(m).
+            !matrices de derivadas con laplaciano
+            !dxm1 = MATMUL(dx,m_n(1:n))
+            !dym1 = MATMUL(dy,m_n(1:n))
+            !dzm1 = MATMUL(dz,m_n(1:n))
+            !dxm2 = MATMUL(dx,m_n(n+1:2*n))
+            !dym2 = MATMUL(dy,m_n(n+1:2*n))
+            !dzm2 = MATMUL(dz,m_n(n+1:2*n))
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),mn_d(1:n),1,BETA,dxm1,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),mn_d(1:n),1,BETA,dym1,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),mn_d(1:n),1,BETA,dzm1,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),mn_d(n+1:2*n),1,BETA,dxm2,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),mn_d(n+1:2*n),1,BETA,dym2,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),mn_d(n+1:2*n),1,BETA,dzm2,1)
+
+
+            !Ig
+            !ter1 = (dxm1*dxm2)+(dym1*dym2)+(dzm1*dzm2) !producto interno nabla_m1,nabla_m2
+            !ax = ter1*dxm2 !array operation
+            !ay = ter1*dym2
+            !az = ter1*dzm2
+            !call kernel cuda fortran
+            call prod<<<n_blocks,n_threads>>>(dxm1,dxm2,ter1,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dym1,dym2,ter1,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(dzm1,dzm2,ter1,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(ter1,dxm2,ax,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter1,dym2,ay,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter1,dzm2,az,1.,0.)
+          
+            !ter2 = (dxm2**2) + (dym2**2) + (dzm2**2) !modulo cuadrado de m2
+            !bx = ter2*dxm1 
+            !by = ter2*dym1
+            !bz = ter2*dzm1
+            call prod<<<n_blocks,n_threads>>>(dxm2,dxm2,ter2,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dym2,dym2,ter2,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(dzm2,dzm2,ter2,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(ter2,dxm1,bx,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter2,dym1,by,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter2,dzm1,bz,1.,0.)
+            
+            !cx = ter1*dxm1
+            !cy = ter1*dym1
+            !cz = ter1*dzm1
+            call prod<<<n_blocks,n_threads>>>(ter1,dxm1,cx,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter1,dym1,cy,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter1,dzm1,cz,1.,0.)
+
+            !ter3 = (dxm1**2) + (dym1**2) + (dzm1**2) !modulo cuadrado de m1
+            !ex = ter3*dxm2
+            !ey = ter3*dym2
+            !ez = ter3*dzm2
+            call prod<<<n_blocks,n_threads>>>(dxm1,dxm1,ter3,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dym1,dym1,ter3,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(dzm1,dzm1,ter3,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(ter3,dxm2,ex,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter3,dym2,ey,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter3,dzm2,ez,1.,0.)
+
+            !diva = MATMUL(dx,ax) + MATMUL(dy,ay) + MATMUL(dz,az)
+            !divb = MATMUL(dx,bx) + MATMUL(dy,by) + MATMUL(dz,bz)
+            !divc = MATMUL(dx,cx) + MATMUL(dy,cy) + MATMUL(dz,cz)
+            !dive = MATMUL(dx,ex) + MATMUL(dy,ey) + MATMUL(dz,ez)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),ax,1,BETA,diva,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),ay,1,BETA,diva,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),az,1,BETA,diva,1)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),bx,1,BETA,divb,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),by,1,BETA,divb,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),bz,1,BETA,divb,1)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),cx,1,BETA,divc,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),cy,1,BETA,divc,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),cz,1,BETA,divc,1)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),ex,1,BETA,dive,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),ey,1,BETA,dive,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),ez,1,BETA,dive,1)
+
+            !mIg(1:n) = param_reg_d(9) * (diva - divb)
+            !mIg(n+1:2*n) = param_reg_d(10) * (divc - dive)
+            call sus<<<n_blocks,n_threads>>>(diva,divb,mIg(1:n),param_reg(9),0.)
+            call sus<<<n_blocks,n_threads>>>(divc,dive,mIg(n+1:2*n),param_reg(10),0.)
+            
+
+            !Calculando direccion de ascenso I(m) por descenso más pronunciado. 
+            !I_new = mIg - Ib
+            n_blocks  = ceiling(real(2*n)/n_threads)
+            call sus<<<n_blocks,n_threads>>>(mIg,Ib_d,I_new_d,1.,0.)
+            !I_new = MATMUL(I_a,m_n) + (mI_G - I_b)            
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(Ia_gv_d,1),size(Ia_gv_d,2),ALPHA,Ia_gv_d,size(Ia_gv_d,1),mn_d(1:n),1,BETA,&
+                                I_new_d(1:n),1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(Ia_mg_d,1),size(Ia_mg_d,2),ALPHA,Ia_mg_d,size(Ia_mg_d,1),mn_d(n+1:2*n),1,BETA,&
+                                I_new_d(n+1:2*n),1)
+
+            ! Bajar arreglos a host y subir separado para siguiente parte.
+            I_new = I_new_d !**Aqui se puede iniciar una segunda hebra, continuar con algunos calculos en host mientras GPU acaba la segunda parte.
+
+
+            !Reset variables temporales.
+            ax=0; ay=0; az=0; bx=0; by=0; bz=0; cx=0; cy=0; cz=0; ex=0; ey=0; ez=0
+            diva=0; divb=0; divc=0; dive=0
+            n_blocks  = ceiling(real(n)/n_threads)
+
+            !Jg
+            !dxI1 = MATMUL(dx,I_new(1:n))
+            !dyI1 = MATMUL(dy,I_new(1:n))
+            !dzI1 = MATMUL(dz,I_new(1:n))
+            !dxI2 = MATMUL(dx,I_new(n+1:2*n))
+            !dyI2 = MATMUL(dy,I_new(n+1:2*n))
+            !dzI2 = MATMUL(dz,I_new(n+1:2*n))
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),I_new_d(1:n),1,BETA,dxI1,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),I_new_d(1:n),1,BETA,dyI1,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),I_new_d(1:n),1,BETA,dzI1,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),I_new_d(n+1:2*n),1,BETA,dxI2,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),I_new_d(n+1:2*n),1,BETA,dyI2,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),I_new_d(n+1:2*n),1,BETA,dzI2,1)
+
+            !ter1J = (dxm2*dxI1)+(dym2*dyI1)+(dzm2*dzI1) !producto interno nabla_m2,nabla_I
+            !ax = ter1J*dxm2
+            !ay = ter1J*dym2
+            !az = ter1J*dzm2
+            call prod<<<n_blocks,n_threads>>>(dxm2,dxI1,ter1J,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dym2,dyI1,ter1J,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(dzm2,dzI1,ter1J,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(ter1J,dxm2,ax,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter1J,dym2,ay,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter1J,dzm2,az,1.,0.)           
+
+            !bx = ter2*dxI1
+            !by = ter2*dyI1
+            !bz = ter2*dzI1
+            call prod<<<n_blocks,n_threads>>>(ter2,dxI1,bx,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter2,dyI1,by,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter2,dzI1,bz,1.,0.)
+            
+            !ter2J = (dxm1*dxI2)+(dym1*dyI2)+(dzm1*dzI2) !producto interno nabla_m1,nabla_I
+            !cx = ter2J*dxm1
+            !cy = ter2J*dym1
+            !cz = ter2J*dzm1
+            call prod<<<n_blocks,n_threads>>>(dxm1,dxI2,ter2J,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dym1,dyI2,ter2J,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(dzm1,dzI2,ter2J,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(ter2J,dxm1,cx,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter2J,dym1,cy,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter2J,dzm1,cz,1.,0.) 
+
+            !ex = ter3*dxI2
+            !ey = ter3*dyI2
+            !ez = ter3*dzI2
+            call prod<<<n_blocks,n_threads>>>(ter3,dxI2,ex,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter3,dyI2,ey,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter3,dzI2,ez,1.,0.) 
+            
+            !divaJ = MATMUL(dx,axJ) + MATMUL(dy,ayJ) + MATMUL(dz,azJ)
+            !divbJ = MATMUL(dx,bxJ) + MATMUL(dy,byJ) + MATMUL(dz,bzJ)
+            !divcJ = MATMUL(dx,cxJ) + MATMUL(dy,cyJ) + MATMUL(dz,czJ)
+            !diveJ = MATMUL(dx,exJ) + MATMUL(dy,eyJ) + MATMUL(dz,ezJ)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),ax,1,BETA,diva,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),ay,1,BETA,diva,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),az,1,BETA,diva,1)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),bx,1,BETA,divb,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),by,1,BETA,divb,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),bz,1,BETA,divb,1)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),cx,1,BETA,divc,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),cy,1,BETA,divc,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),cz,1,BETA,divc,1)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),ex,1,BETA,dive,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),ey,1,BETA,dive,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),ez,1,BETA,dive,1)
+
+            !mJg(1:n) = param_reg_d(9) * (divaJ - divbJ)
+            !mJg(n+1:2*n) = param_reg_d(10) * (divcJ - diveJ)
+            call sus<<<n_blocks,n_threads>>>(diva,divb,mJg(1:n),param_reg(9),0.)
+            call sus<<<n_blocks,n_threads>>>(divc,dive,mJg(n+1:2*n),param_reg(10),0.)
+
+            ! Bajar arreglos a host
+            mJg_h = mJg
+
+            ! TERMINAN CALCULOS EN GPU
+            istat = cublasDestroy(h)
+            if (istat .ne. 0) print *,"cublasDestroy returned ",istat
+            print*, 'Continuan calculos en CPU iteracación: ', ii
+
+            ! Evaluar eficiencia.
+            call cpu_time(finish)
+            OPEN(unit=0,file='output_time.txt',status='old')
+            WRITE(0,*) 'Execution time: GPU part jointGram =', (finish-start), 'seg =', (finish-start)/60, 'min'
+            
+
+            !Direccion de ascenso mediante gradientes conjugados.
+            if (ii == 1) then
+                  Iconj_new = I_new
+            else
+                  Iconj_new = I_new + ( (DOT_PRODUCT(I_new,I_new)/DOT_PRODUCT(I,I)) * Iconj )
+            end if
+
+
+            ! Tamaño de paso kn en la dirección I(m).
+            kn_1 = DOT_PRODUCT(Iconj_new,I_new)
+
+            kn_2a(1:n) = MATMUL(Ia_gv,Iconj_new(1:n))
+            kn_2a(n+1:2*n) = MATMUL(Ia_mg,Iconj_new(n+1:2*n))
+            
+            kn_2b = DOT_PRODUCT(Iconj_new,kn_2a)
+            kn_2c = DOT_PRODUCT(Iconj_new,mJg_h)
+
+            kn = kn_1 / (kn_2b + kn_2c +1e-10)  !para evitar divisiones por cero
+
+            !Calculo m_new
+            m_new = m_n - (kn*Iconj_new) !array operation
+            ! Subir arreglos a device para siguiente iteracion
+            mn_d = m_new
+
+            !***************************
+            !Convergencia
+            conv_gv = 100 * SQRT( SUM( ((m_new(1:n)-m_n(1:n))**2)/((m_n(1:n)**2)+1e-10) )/n )
+            conv_mg = 100 * SQRT( SUM( ((m_new(n+1:2*n)-m_n(n+1:2*n))**2)/((m_n(n+1:2*n)**2)+1e-10) )/n )
+
+            !Actualizando variables para la siguiente iteración
+            m_n = m_new
+            I = I_new
+            Iconj = Iconj_new
+
+            
+            !Obteniendo datos calculados
+            Am(1:m) = MATMUL(A_gv,m_new(1:n))
+            Am(m+1:2*m) = MATMUL(A_mg,m_new(n+1:2*n))
+
+            !RMS
+            dr(1:m) = Am(1:m) - d_gv !array operation
+            dr(m+1:2*m) = Am(m+1:2*m) - d_mg
+            dr(1:m) = Wd_gv * dr(1:m) !array operation
+            dr(m+1:2*m) = Wd_mg * dr(m+1:2*m)
+
+            rms_gv = DOT_PRODUCT(dr(1:m),dr(1:m))
+            rms_gv = SQRT(rms_gv/m)
+
+            rms_mg = DOT_PRODUCT(dr(m+1:2*m),dr(m+1:2*m))
+            rms_mg = SQRT(rms_mg/m)
+
+            WRITE(16,'(I3,",",F14.4,",",F14.4,",",F10.4,",",F10.4)') ii,conv_gv,conv_mg,rms_gv,rms_mg
+
+            
+            !Escribir resultados
+            ! Escribir archivos de modelos invertidos
+            WRITE (filename1, '("output_jointGram_gv_minv_c",I1,"_iter",I1,".csv")' ) ciclo, ii
+            OPEN(unit=9,file=filename1,status='unknown') !crear y escribir en archivo
+            WRITE(9,*) 'x[m],y[m],z[m],Density_Contrast[g/cm**3]'
+
+            WRITE (filename2, '("output_jointGram_mg_minv_c",I1,"_iter",I1,".csv")' ) ciclo, ii
+            OPEN(unit=10,file=filename2,status='unknown') !crear y escribir en archivo
+            WRITE(10,*) 'x[m],y[m],z[m],Magnetization_Contrast[A/m]'
+
+            do jj = 1,n,1
+                  WRITE(9,'(F10.3,",",F11.3,",",F10.3,",",E11.4)') xcell(jj),ycell(jj),zcell(jj),m_new(jj)
+                  WRITE(10,'(F10.3,",",F11.3,",",F10.3,",",E11.4)') xcell(jj),ycell(jj),zcell(jj),m_new(n+jj)
+            end do
+
+            CLOSE(unit=9)
+            CLOSE(unit=10)
+
+            ! Escribir archivos de datos calculados a partir de modelos invertidos
+            WRITE (filename3, '("output_jointGram_gv_anomaly_c",I1,"_iter",I1,".csv")' ) ciclo, ii
+            OPEN(unit=11,file=filename3,status='unknown') !crear y escribir en archivo
+            WRITE(11,*) 'x[m],y[m],z[m],g[mGal]'
+
+            WRITE (filename4, '("output_jointGram_mg_anomaly_c",I1,"_iter",I1,".csv")' ) ciclo, ii
+            OPEN(unit=12,file=filename4,status='unknown') !crear y escribir en archivo
+            WRITE(12,*) 'x[m],y[m],z[m],m[nT]'
+
+            do kk = 1,m,1
+                  WRITE(11,'(F10.3,",",F11.3,",",F10.3,",",E11.4)') xobs(kk),yobs(kk),zobs_gv(kk),Am(kk)
+                  WRITE(12,'(F10.3,",",F11.3,",",F10.3,",",E11.4)') xobs(kk),yobs(kk),zobs_mg(kk),Am(m+kk)
+            end do
+
+            CLOSE(unit=11)
+            CLOSE(unit=12)
+            
+            ! Evaluar eficiencia.
+            call cpu_time(finish)
+            OPEN(unit=0,file='output_time.txt',status='old')
+            WRITE(0,*) 'Execution time: CPU part jointGram =', (finish-start), 'seg =', (finish-start)/60, 'min'
+
+      end if
+end do
+
+CLOSE(unit=16)
+
+
+deallocate ( dxm1,dym1,dzm1,dxm2,dym2,dzm2,ter1,ter2,ter3,diva,divb,divc,dive,ax,ay,az,bx,by,bz,cx,cy,cz,ex,ey,ez, &
+             dxI1,dyI1,dzI1,dxI2,dyI2,dzI2,ter1J,ter2J )
+deallocate ( dx_d,dy_d,dz_d,mn_d,Ia_gv_d,Ia_mg_d,Ib_d,mIg,mJg,I_new_d)
+
+!close(unit=0)
+
+return
+end subroutine jointGramPL2
+!*******************************************************************************
+
+
+subroutine jointGramPL3(m,n,nx,ny,nz,step,xobs,yobs,zobs_gv,zobs_mg,xcell,ycell,zcell,d_gv,stdevd_gv,m_gv,stdevm_gv,mapr_gv,A_gv, &
+                        d_mg,stdevd_mg,m_mg,stdevm_mg,mapr_mg,A_mg,param_reg,dip,strike,num_iters,err0,ciclo)
+! Subrutina que calcula inversion conjunta de dos modelos gravimétrico y magnético
+! considerando similitud estructural evaluada por gradientes cruzados implementada mediante el enfoque Gramiano.
+! Empleando cuBlas en todo el proceso, calculo casi completamente en GPU, más rápido pero limitado a memoria VRAM de la tarjeta.
+
+use cudafor
+use cublas_v2
+use iso_fortran_env , dp => real64
+use auxiliar, only: cov, partialder, laplaciano
+
+implicit none
+
+integer, value :: m, n
+integer, intent(in) :: num_iters, nx, ny, nz, ciclo
+real, intent(in) :: step, err0, dip, strike
+real, dimension(10) :: param_reg
+!real, intent(in), dimension(nx*ny) :: zobs_gv, zobs_mg
+!real, intent(in), dimension(nx*ny) :: d_gv, d_mg, stdevd_gv, stdevd_mg
+!real, intent(in), dimension(nx*ny*nz) :: m_gv, m_mg, mapr_gv, mapr_mg, stdevm_gv, stdevm_mg
+!real(dp), intent(in), dimension(nx*ny,nx*ny*nz) :: A_gv, A_mg
+real, allocatable, dimension (:) :: xobs, yobs, zobs_gv, zobs_mg, xcell, ycell, zcell
+real, allocatable, dimension(:) :: d_gv, d_mg, stdevd_gv, stdevd_mg, m_gv, m_mg, mapr_gv, mapr_mg, stdevm_gv, stdevm_mg
+real(dp), allocatable, dimension(:,:) :: A_gv, A_mg
+
+real(dp), allocatable, dimension(:,:) :: dx, dy, dz, opL, opM
+real(dp), device, allocatable, dimension(:,:) :: dx_d, dy_d, dz_d, opL_d, opM_d
+
+real(dp), device, allocatable, dimension(:,:) :: aL2, gM2, eN2
+real, allocatable, dimension(:,:) :: Wm2, Wd2
+real(dp), device, allocatable, dimension(:,:) :: bWm2, Wd2_d
+real(dp), device, allocatable, dimension(:) :: dgv_d, maprgv_d, dmg_d, maprmg_d
+real(dp), device, allocatable, dimension(:,:) :: ATWd2, ATWd2A
+
+real(dp), device :: Agv_d(m,n), Amg_d(m,n), Ia_gv(n,n), Ia_mg(n,n)
+real(dp), device, dimension(2*n) :: Ib, mn_d, mn_new
+
+real(dp), device, allocatable, dimension(:) :: dxm1, dym1, dzm1, dxm2, dym2, dzm2, ter1, ter2, ter3, diva, divb, divc, dive, &
+                                               ax, ay, az, bx, by, bz, cx, cy, cz, ex, ey, ez, &
+                                               dxI1, dyI1, dzI1, dxI2, dyI2, dzI2, ter1J, ter2J
+
+real(dp), device, allocatable, dimension(:) :: mIg, mJg, I_new, I, Iconj, Iconj_new, kn_2a
+real(dp) :: kn_1, kn_2b, kn_2c, kn, Inew2, I2, resI
+real, device :: param_reg_9, param_reg_10
+real(dp), device, dimension(2*m) :: Am
+real(dp) :: Am_h(2*m), dr(2*m), mn_h(2*n), mnew_h(2*n)
+
+real :: conv_gv, conv_mg, rms_gv, rms_mg
+real :: Wd_gv(m), Wd_mg(m)
+integer, value :: ii, jj, kk
+character(len=42) :: filename00, filename1, filename2, filename3, filename4
+real :: start, finish
+
+!variables extra para paralelizar
+type(cublasHandle) :: h
+type(cudaDeviceProp) :: prop
+real(dp) :: ALPHA=1.0 , BETA=0.0
+integer :: istat, n_threads, n_blocks
+!type(dim3) :: blocksPerGrid, threadsPerBlock
+
+!**********************
+! INICIAR CALCULOS EN GPU
+istat = cublasCreate(h)
+if (istat .ne. 0) print *,"cublasCreate returned ",istat
+print*, 'Inicia calculo de modelos en GPU'
+
+!Evaluar eficiencia.
+call cpu_time(start)
+print*, 'Inician calculos en paralelo'
+
+!Definir numero de hilos y bloques para arreglos 1D y 2D
+istat = cudaGetDeviceProperties(prop, 0)  ! Supongo que sólo se tiene acceso a una GPU
+n_threads = prop%maxThreadsPerBlock
+n_blocks  = ceiling(real(n)/n_threads)
+!print*, 'n_threads=',n_threads, 'n_blocks=',n_blocks
+!threadsPerBlock = dim3( 32, 32, 1 )
+!blocksPerGrid = dim3( ceiling(real(n)/real(threadsPerBlock%x)), ceiling(real(n)/real(threadsPerBlock%y)), 1 )
+!print*, 'threadsPerBlock x=',threadsPerBlock%x, 'blocksPerGrid x=',blocksPerGrid%x
+
+
+!***********************
+!reservar memoria para arreglos temporales, comentados porque son arreglos heredados del programa principal
+!allocate ( d_gv(m),d_mg(m),mapr_gv(n),mapr_mg(n),m_gv(n),m_mg(n),stdevd_gv(m),stdevd_mg(m),stdevm_gv(n),stdevm_mg(n), &
+!           A_gv(m,n),A_mg(m,n),xcell(n), ycell(n), zcell(n), xobs(m), yobs(m), zobs_gv(m), zobs_mg(m) )
+allocate ( dx(n,n),dy(n,n),dz(n,n),opL(n,n),opM(n,n),dx_d(n,n),dy_d(n,n),dz_d(n,n),opL_d(n,n),opM_d(n,n) )
+
+!matrices para derivadas
+call partialder(nx,ny,nz,step,'x',dx)
+call partialder(nx,ny,nz,step,'y',dy)
+call partialder(nx,ny,nz,step,'z',dz)
+dx_d = dx
+dy_d = dy
+dz_d = dz
+
+!Operador Suavidad
+call laplaciano(nx,ny,nz,step,opL)
+opL_d = opL
+
+!Operador variacion horizontal total
+opM = dx*cos(dip)*cos(strike) + dy*cos(dip)*sin(strike) + dz*sin(dip)
+opM_d = opM
+
+!Operador variacion vertical
+!opN = dz
+param_reg_9 = param_reg(9)
+param_reg_10 = param_reg(10)
+
+deallocate(dx,dy,dz,opL,opM)
+
+
+!***********************
+allocate ( aL2(n,n),gM2(n,n),eN2(n,n),Wm2(n,n),Wd2(m,m),bWm2(n,n),Wd2_d(m,m),ATWd2(n,m),ATWd2A(n,n) )
+!para gv
+allocate ( dgv_d(m),maprgv_d(n) )
+
+!opL2 = MATMUL(transpose(opL),opL)
+ALPHA = param_reg(1)
+istat = cublasDgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,n,n,n,ALPHA,opL_d,n,opL_d,n,BETA,aL2,n)
+
+!opM2 = MATMUL(transpose(opM),opM)
+ALPHA = param_reg(5)
+istat = cublasDgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,n,n,n,ALPHA,opM_d,n,opM_d,n,BETA,gM2,n)
+
+!opN2 = MATMUL(transpose(opN),opN)
+ALPHA = param_reg(7)
+istat = cublasDgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,n,n,n,ALPHA,dz_d,n,dz_d,n,BETA,eN2,n)
+
+!Calculando matrices de pesos
+call cov(n,1,stdevm_gv,Wm2)
+bWm2 = param_reg(3) * Wm2
+
+call cov(m,1,stdevd_gv,Wd2)
+Wd2_d = Wd2
+!Recordar W**2 = C-1 = 1/(stdev**2) = 1/varianza (type=1). Pesos W son 1/stdev (type=2).
+Wd_gv = 1/stdevd_gv
+
+Agv_d = A_gv
+ALPHA = 1.0
+!ATWd2 = MATMUL(transpose(A_gv),Wd2)
+istat = cublasDgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,size(Agv_d,2),size(Wd2_d,2),size(Agv_d,1),ALPHA, &
+                    Agv_d,size(Agv_d,1),Wd2_d,size(Wd2_d,1),BETA,ATWd2,size(ATWd2,1))
+!ATWd2A = MATMUL(ATWd2,A_gv)
+istat = cublasDgemm(h,CUBLAS_OP_N,CUBLAS_OP_N,size(ATWd2,1),size(Agv_d,2),size(ATWd2,2),ALPHA, &
+                    ATWd2,size(ATWd2,1),Agv_d,size(Agv_d,1),BETA,ATWd2A,size(ATWd2A,1))
+
+!Para calcular direccion de descenso I(m)
+!Ia_gv = ATWd2A + aL2 + bWm2 + gM2 + eN2
+!call adi_ma<<<blocksPerGrid,threadsPerBlock>>>(ATWd2A,aL2,Ia_gv,0)
+!call adi_ma<<<blocksPerGrid,threadsPerBlock>>>(bWm2,gM2,Ia_gv,1)
+!call adi_ma<<<blocksPerGrid,threadsPerBlock>>>(Ia_gv,ATWd2A,Ia_gv,0)
+
+!$cuf kernel do(2) <<< *,* >>>  !kernel loop directives (CUF kernels)
+do jj = 1, n
+      do ii = 1, n
+            Ia_gv(ii,jj) = ATWd2A(ii,jj) + aL2(ii,jj) + bWm2(ii,jj) + gM2(ii,jj) + eN2(ii,jj)
+      enddo
+enddo
+
+!Ib(1:n) = MATMUL(ATWd2,d_gv) + MATMUL(bWm2,mapr_gv)
+dgv_d = d_gv
+maprgv_d = mapr_gv
+BETA = 0.0
+istat = cublasDgemv(h,CUBLAS_OP_N,size(ATWd2,1),size(ATWd2,2),ALPHA,ATWd2,size(ATWd2,1),dgv_d,1,BETA, &
+                    Ib(1:n),1)
+BETA = 1.0
+istat = cublasDgemv(h,CUBLAS_OP_N,size(bWm2,1),size(bWm2,2),ALPHA,bWm2,size(bWm2,1),maprgv_d,1,BETA,Ib(1:n),1)
+
+mn_h(1:n) = m_gv
+mn_d(1:n) = m_gv
+deallocate(stdevm_gv,stdevd_gv,A_gv,mapr_gv,m_gv, dgv_d,maprgv_d)
+
+!**********************
+!para mg
+aL2=0; gM2=0; eN2=0; Wm2=0; bWm2=0; Wd2=0; Wd2_d=0; ATWd2=0; ATWd2A=0
+allocate ( dmg_d(m),maprmg_d(n) )
+
+!opL2 = MATMUL(transpose(opL),opL)
+ALPHA = param_reg(2)
+istat = cublasDgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,n,n,n,ALPHA,opL_d,n,opL_d,n,BETA,aL2,n)
+
+!opM2 = MATMUL(transpose(opM),opM)
+ALPHA = param_reg(6)
+istat = cublasDgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,n,n,n,ALPHA,opM_d,n,opM_d,n,BETA,gM2,n)
+
+!opN2 = MATMUL(transpose(opN),opN)
+ALPHA = param_reg(8)
+istat = cublasDgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,n,n,n,ALPHA,dz_d,n,dz_d,n,BETA,eN2,n)
+
+!Calculando matrices de pesos
+call cov(n,1,stdevm_mg,Wm2)
+bWm2 = param_reg(4) * Wm2
+
+call cov(m,1,stdevd_mg,Wd2)
+Wd2_d = Wd2
+!Recordar W**2 = C-1 = 1/(stdev**2) = 1/varianza (type=1). Pesos W son 1/stdev (type=2).
+Wd_mg = 1/stdevd_mg
+
+Amg_d = A_mg
+ALPHA = 1.0
+!ATWd2 = MATMUL(transpose(A_mg),Wd2)
+istat = cublasDgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,size(Amg_d,2),size(Wd2_d,2),size(Amg_d,1),ALPHA, &
+                    Amg_d,size(Amg_d,1),Wd2_d,size(Wd2_d,1),BETA,ATWd2,size(ATWd2,1))
+!ATWd2A = MATMUL(ATWd2,A_mg)
+istat = cublasDgemm(h,CUBLAS_OP_N,CUBLAS_OP_N,size(ATWd2,1),size(Amg_d,2),size(ATWd2,2),ALPHA, &
+                    ATWd2,size(ATWd2,1),Amg_d,size(Amg_d,1),BETA,ATWd2A,size(ATWd2A,1))
+
+!Para calcular direccion de descenso I(m)
+!Ia_mg = ATWd2A + aL2 + bWm2 + gM2 + eN2
+!call adi_ma<<<blocksPerGrid,threadsPerBlock>>>(aL2,bWm2,Ia_mg,0)
+!call adi_ma<<<blocksPerGrid,threadsPerBlock>>>(gM2,eN2,Ia_mg,1)
+!call adi_ma<<<blocksPerGrid,threadsPerBlock>>>(Ia_mg,ATWd2A,Ia_mg,0)
+
+!$cuf kernel do(2) <<< *,* >>>  !kernel loop directives (CUF kernels)
+do jj = 1, n
+      do ii = 1, n
+            Ia_mg(ii,jj) = ATWd2A(ii,jj) + aL2(ii,jj) + bWm2(ii,jj) + gM2(ii,jj) + eN2(ii,jj)
+      enddo
+enddo
+
+!Ib(n+1:2*n) = MATMUL(ATWd2,d_mg) + MATMUL(bWm2,mapr_mg)
+dmg_d = d_mg
+maprmg_d = mapr_mg
+BETA = 0.0
+istat = cublasDgemv(h,CUBLAS_OP_N,size(ATWd2,1),size(ATWd2,2),ALPHA,ATWd2,size(ATWd2,1),dmg_d,1,BETA, &
+                    Ib(n+1:2*n),1)
+BETA = 1.0
+istat = cublasDgemv(h,CUBLAS_OP_N,size(bWm2,1),size(bWm2,2),ALPHA,bWm2,size(bWm2,1),maprmg_d,1,BETA,Ib(n+1:2*n),1)
+
+mn_h(n+1:2*n) = m_mg
+mn_d(n+1:2*n) = m_mg
+deallocate(stdevm_mg,stdevd_mg,A_mg,mapr_mg,m_mg, dmg_d,maprmg_d)
+deallocate (aL2,gM2,eN2,Wm2,bWm2,Wd2,Wd2_d,ATWd2,ATWd2A)
+
+!**********************
+allocate ( dxm1(n),dym1(n),dzm1(n),dxm2(n),dym2(n),dzm2(n),ter1(n),ter2(n),ter3(n),diva(n),divb(n),divc(n),dive(n), &
+           ax(n),ay(n),az(n),bx(n),by(n),bz(n),cx(n),cy(n),cz(n),ex(n),ey(n),ez(n), &
+           dxI1(n),dyI1(n),dzI1(n),dxI2(n),dyI2(n),dzI2(n),ter1J(n),ter2J(n) )
+allocate ( mIg(2*n), mJg(2*n),I_new(2*n), I(2*n), Iconj(2*n), Iconj_new(2*n), kn_2a(2*n) )
+
+
+WRITE (filename00, '("output_misfit_jointGram_c",I1,".txt")' ) ciclo
+OPEN(unit=16,file=filename00,status='unknown')
+WRITE(16,*) 'iteracion,convergencia%_gv,convergencia%_mg,RMS_gv,RMS_mg'
+
+!Método iterativo Gradiente Conjugado Regularizado RCG.
+conv_gv = 1e6 !error inicial (valor arbitrario grande)
+conv_mg = 1e6
+! Condicion de paro
+do ii = 1,num_iters,1 
+      if ((conv_gv > err0).and.(conv_mg > err0)) then
+            !n_blocks  = ceiling(real(n)/n_threads)
+
+            !Preparativos para calcular I(m).
+            !matrices de derivadas con laplaciano
+            !dxm1 = MATMUL(dx,m_n(1:n))
+            !dym1 = MATMUL(dy,m_n(1:n))
+            !dzm1 = MATMUL(dz,m_n(1:n))
+            !dxm2 = MATMUL(dx,m_n(n+1:2*n))
+            !dym2 = MATMUL(dy,m_n(n+1:2*n))
+            !dzm2 = MATMUL(dz,m_n(n+1:2*n))
+            ALPHA = 1.
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),mn_d(1:n),1,BETA,dxm1,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),mn_d(1:n),1,BETA,dym1,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),mn_d(1:n),1,BETA,dzm1,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),mn_d(n+1:2*n),1,BETA,dxm2,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),mn_d(n+1:2*n),1,BETA,dym2,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),mn_d(n+1:2*n),1,BETA,dzm2,1)
+
+
+            !Ig
+            !ter1 = (dxm1*dxm2)+(dym1*dym2)+(dzm1*dzm2) !producto interno nabla_m1,nabla_m2
+            !ax = ter1*dxm2 !array operation
+            !ay = ter1*dym2
+            !az = ter1*dzm2
+            call prod<<<n_blocks,n_threads>>>(dxm1,dxm2,ter1,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dym1,dym2,ter1,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(dzm1,dzm2,ter1,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(ter1,dxm2,ax,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter1,dym2,ay,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter1,dzm2,az,1.,0.)
+          
+            !ter2 = (dxm2**2) + (dym2**2) + (dzm2**2) !modulo cuadrado de m2
+            !bx = ter2*dxm1 
+            !by = ter2*dym1
+            !bz = ter2*dzm1
+            call prod<<<n_blocks,n_threads>>>(dxm2,dxm2,ter2,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dym2,dym2,ter2,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(dzm2,dzm2,ter2,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(ter2,dxm1,bx,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter2,dym1,by,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter2,dzm1,bz,1.,0.)
+            
+            !cx = ter1*dxm1
+            !cy = ter1*dym1
+            !cz = ter1*dzm1
+            call prod<<<n_blocks,n_threads>>>(ter1,dxm1,cx,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter1,dym1,cy,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter1,dzm1,cz,1.,0.)
+
+            !ter3 = (dxm1**2) + (dym1**2) + (dzm1**2) !modulo cuadrado de m1
+            !ex = ter3*dxm2
+            !ey = ter3*dym2
+            !ez = ter3*dzm2
+            call prod<<<n_blocks,n_threads>>>(dxm1,dxm1,ter3,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dym1,dym1,ter3,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(dzm1,dzm1,ter3,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(ter3,dxm2,ex,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter3,dym2,ey,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter3,dzm2,ez,1.,0.)
+
+            !diva = MATMUL(dx,ax) + MATMUL(dy,ay) + MATMUL(dz,az)
+            !divb = MATMUL(dx,bx) + MATMUL(dy,by) + MATMUL(dz,bz)
+            !divc = MATMUL(dx,cx) + MATMUL(dy,cy) + MATMUL(dz,cz)
+            !dive = MATMUL(dx,ex) + MATMUL(dy,ey) + MATMUL(dz,ez)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),ax,1,BETA,diva,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),ay,1,BETA,diva,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),az,1,BETA,diva,1)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),bx,1,BETA,divb,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),by,1,BETA,divb,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),bz,1,BETA,divb,1)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),cx,1,BETA,divc,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),cy,1,BETA,divc,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),cz,1,BETA,divc,1)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),ex,1,BETA,dive,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),ey,1,BETA,dive,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),ez,1,BETA,dive,1)
+
+            !mIg(1:n) = param_reg_d(9) * (diva - divb)
+            !mIg(n+1:2*n) = param_reg_d(10) * (divc - dive)
+            !call sus<<<n_blocks,n_threads>>>(diva,divb,mIg(1:n),param_reg(9),0.)
+            !call sus<<<n_blocks,n_threads>>>(divc,dive,mIg(n+1:2*n),param_reg(10),0.)
+            
+            !$cuf kernel do <<<*,*>>>   !kernel loop directives (CUF kernels)
+            do kk = 1, n
+                  mIg(kk) = param_reg_9 * (diva(kk) - divb(kk))
+                  mIg(n+kk) = param_reg_10 * (divc(kk) - dive(kk))
+            enddo
+
+            !Calculando direccion de ascenso I(m) por descenso más pronunciado. 
+            !I_new = mIg - Ib
+            !call sus<<<n_blocks,n_threads>>>(mIg,Ib,I_new,1.,0.)
+            
+            !$cuf kernel do <<<*,*>>>   !kernel loop directives (CUF kernels)
+            do kk = 1, 2*n
+                  I_new(kk) = mIg(kk) - Ib(kk)
+            enddo
+            
+            !I_new = MATMUL(I_a,m_n) + (mI_G - I_b)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(Ia_gv,1),size(Ia_gv,2),ALPHA,Ia_gv,size(Ia_gv,1),mn_d(1:n),1,BETA,&
+                                I_new(1:n),1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(Ia_mg,1),size(Ia_mg,2),ALPHA,Ia_mg,size(Ia_mg,1),mn_d(n+1:2*n),1,BETA,&
+                                I_new(n+1:2*n),1)
+
+
+            !Reset variables temporales.
+            ax=0; ay=0; az=0; bx=0; by=0; bz=0; cx=0; cy=0; cz=0; ex=0; ey=0; ez=0
+            diva=0; divb=0; divc=0; dive=0
+
+            !Jg
+            !dxI1 = MATMUL(dx,I_new(1:n))
+            !dyI1 = MATMUL(dy,I_new(1:n))
+            !dzI1 = MATMUL(dz,I_new(1:n))
+            !dxI2 = MATMUL(dx,I_new(n+1:2*n))
+            !dyI2 = MATMUL(dy,I_new(n+1:2*n))
+            !dzI2 = MATMUL(dz,I_new(n+1:2*n))
+            ALPHA = 1.
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),I_new(1:n),1,BETA,dxI1,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),I_new(1:n),1,BETA,dyI1,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),I_new(1:n),1,BETA,dzI1,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),I_new(n+1:2*n),1,BETA,dxI2,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),I_new(n+1:2*n),1,BETA,dyI2,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),I_new(n+1:2*n),1,BETA,dzI2,1)
+
+            !ter1J = (dxm2*dxI1)+(dym2*dyI1)+(dzm2*dzI1) !producto interno nabla_m2,nabla_I
+            !ax = ter1J*dxm2
+            !ay = ter1J*dym2
+            !az = ter1J*dzm2
+            call prod<<<n_blocks,n_threads>>>(dxm2,dxI1,ter1J,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dym2,dyI1,ter1J,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(dzm2,dzI1,ter1J,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(ter1J,dxm2,ax,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter1J,dym2,ay,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter1J,dzm2,az,1.,0.)           
+
+            !bx = ter2*dxI1
+            !by = ter2*dyI1
+            !bz = ter2*dzI1
+            call prod<<<n_blocks,n_threads>>>(ter2,dxI1,bx,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter2,dyI1,by,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter2,dzI1,bz,1.,0.)
+            
+            !ter2J = (dxm1*dxI2)+(dym1*dyI2)+(dzm1*dzI2) !producto interno nabla_m1,nabla_I
+            !cx = ter2J*dxm1
+            !cy = ter2J*dym1
+            !cz = ter2J*dzm1
+            call prod<<<n_blocks,n_threads>>>(dxm1,dxI2,ter2J,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dym1,dyI2,ter2J,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(dzm1,dzI2,ter2J,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(ter2J,dxm1,cx,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter2J,dym1,cy,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter2J,dzm1,cz,1.,0.) 
+
+            !ex = ter3*dxI2
+            !ey = ter3*dyI2
+            !ez = ter3*dzI2
+            call prod<<<n_blocks,n_threads>>>(ter3,dxI2,ex,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter3,dyI2,ey,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter3,dzI2,ez,1.,0.) 
+            
+            !divaJ = MATMUL(dx,axJ) + MATMUL(dy,ayJ) + MATMUL(dz,azJ)
+            !divbJ = MATMUL(dx,bxJ) + MATMUL(dy,byJ) + MATMUL(dz,bzJ)
+            !divcJ = MATMUL(dx,cxJ) + MATMUL(dy,cyJ) + MATMUL(dz,czJ)
+            !diveJ = MATMUL(dx,exJ) + MATMUL(dy,eyJ) + MATMUL(dz,ezJ)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),ax,1,BETA,diva,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),ay,1,BETA,diva,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),az,1,BETA,diva,1)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),bx,1,BETA,divb,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),by,1,BETA,divb,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),bz,1,BETA,divb,1)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),cx,1,BETA,divc,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),cy,1,BETA,divc,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),cz,1,BETA,divc,1)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),ex,1,BETA,dive,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),ey,1,BETA,dive,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),ez,1,BETA,dive,1)
+
+            !mJg(1:n) = param_reg_d(9) * (divaJ - divbJ)
+            !mJg(n+1:2*n) = param_reg_d(10) * (divcJ - diveJ)
+            !call sus<<<n_blocks,n_threads>>>(diva,divb,mJg(1:n),param_reg(9),0.)
+            !call sus<<<n_blocks,n_threads>>>(divc,dive,mJg(n+1:2*n),param_reg(10),0.)
+
+            !$cuf kernel do <<<*,*>>>   !kernel loop directives (CUF kernels)
+            do kk = 1, n
+                  mJg(kk) = param_reg_9 * (diva(kk) - divb(kk))
+                  mJg(n+kk) = param_reg_10 * (divc(kk) - dive(kk))
+            enddo
+          
+            !Direccion de ascenso mediante gradientes conjugados.
+            !n_blocks  = ceiling(real(2*n)/n_threads)
+            if (ii == 1) then
+                  Iconj_new = I_new
+            else
+                  !Iconj_new = I_new + ( (DOT_PRODUCT(I_new,I_new)/DOT_PRODUCT(I,I))*Iconj )
+                  istat = cublasDdot(h,size(I_new),I_new,1,I_new,1,Inew2)
+                  istat = cublasDdot(h,size(I),I,1,I,1,I2)
+                  resI = Inew2 / I2
+                  !call avec<<<n_blocks,n_threads>>>(Iconj,Iconj,resI,0.)
+                  !call adi<<<n_blocks,n_threads>>>(I_new,Iconj,Iconj_new,1.,0.)
+            
+                  !$cuf kernel do <<<*,*>>>   !kernel loop directives (CUF kernels)
+                  do kk = 1, 2*n
+                        Iconj_new(kk) = I_new(kk) + resI*Iconj(kk)
+                  enddo
+
+            end if
+ 
+
+            ! Tamaño de paso kn en la dirección I(m).
+            !kn_1 = DOT_PRODUCT(Iconj_new,I_new)
+            istat = cublasDdot(h,size(Iconj_new),Iconj_new,1,I_new,1,kn_1)
+
+            !kn_2a(1:n) = MATMUL(Ia_gv,Iconj_new(1:n))
+            !kn_2a(n+1:2*n) = MATMUL(Ia_mg,Iconj_new(n+1:2*n))
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(Ia_gv,1),size(Ia_gv,2),ALPHA,Ia_gv,size(Ia_gv,1),Iconj_new(1:n),1,BETA, &
+                                kn_2a(1:n),1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(Ia_mg,1),size(Ia_mg,2),ALPHA,Ia_mg,size(Ia_mg,1),Iconj_new(n+1:2*n),1,BETA, &
+                                kn_2a(n+1:2*n),1)
+            
+            !kn_2b = DOT_PRODUCT(Iconj_new,kn_2a)
+            istat = cublasDdot(h,size(Iconj_new),Iconj_new,1,kn_2a,1,kn_2b)
+           
+            !kn_2c = DOT_PRODUCT(Iconj_new,mJg_h)
+            istat = cublasDdot(h,size(Iconj_new),Iconj_new,1,mJg,1,kn_2c)
+
+            kn = kn_1 / (kn_2b + kn_2c +1e-10)  !para evitar divisiones por cero
+
+            !Calculo mn_new
+            !mn_new = mn_d - (kn*Iconj_new)
+            !call avec<<<n_blocks,n_threads>>>(Iconj_new,Iconj_new,kn,0.)
+            !call sus<<<n_blocks,n_threads>>>(mn_d,Iconj_new,mn_new,1.,0.)
+
+            !$cuf kernel do <<<*,*>>>   !kernel loop directives (CUF kernels)
+            do kk = 1, 2*n
+                  mn_new(kk) = mn_d(kk) - (kn*Iconj_new(kk))
+            enddo
+
+            !Actualizando variables para la siguiente iteración
+            mn_d = mn_new
+            I = I_new
+            Iconj = Iconj_new
+
+            !Obteniendo datos calculados
+            !Am(1:m) = MATMUL(A_gv,mn_new(1:n))
+            !Am(m+1:2*m) = MATMUL(A_mg,mn_new(n+1:2*n))
+            ALPHA = 1.0
+            BETA = 0.0
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(Agv_d,1),size(Agv_d,2),ALPHA,Agv_d,size(Agv_d,1),mn_new(1:n),1,BETA,Am(1:m),1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(Amg_d,1),size(Amg_d,2),ALPHA,Amg_d,size(Amg_d,1),mn_new(n+1:2*n),1,BETA, &
+                                Am(m+1:2*m),1)
+
+            !Bajar  arreglos a Host
+            mnew_h = mn_new
+            Am_h = Am
+
+            ! Evaluar eficiencia.
+            call cpu_time(finish)
+            OPEN(unit=0,file='output_time.txt',status='old')
+            WRITE(0,*) 'Execution time: GPU part jointGram =', (finish-start), 'seg =', (finish-start)/60, 'min'
+            !print*, 'Calculo de errores y generacion de archivos de salida en CPU iteracion:', ii
+            call cpu_time(start)
+
+            !***************************
+            !Convergencia
+            conv_gv = 100 * SQRT( SUM( ((mnew_h(1:n)-mn_h(1:n))**2)/((mn_h(1:n)**2)+1e-10) )/n )
+            conv_mg = 100 * SQRT( SUM( ((mnew_h(n+1:2*n)-mn_h(n+1:2*n))**2)/((mn_h(n+1:2*n)**2)+1e-10) )/n )
+            mn_h = mnew_h
+          
+            !RMS
+            dr(1:m) = Am_h(1:m) - d_gv !array operation
+            dr(m+1:2*m) = Am_h(m+1:2*m) - d_mg
+            dr(1:m) = Wd_gv * dr(1:m)
+            dr(m+1:2*m) = Wd_mg * dr(m+1:2*m)
+
+            rms_gv = DOT_PRODUCT(dr(1:m),dr(1:m))
+            rms_gv = SQRT(rms_gv/m)
+
+            rms_mg = DOT_PRODUCT(dr(m+1:2*m),dr(m+1:2*m))
+            rms_mg = SQRT(rms_mg/m)
+
+            !Escribir resultados
+            WRITE(16,'(I3,",",F14.4,",",F14.4,",",F10.4,",",F10.4)') ii,conv_gv,conv_mg,rms_gv,rms_mg
+
+            ! Escribir archivos de modelos invertidos
+            WRITE (filename1, '("output_jointGram_gv_minv_c",I1,"_iter",I1,".csv")' ) ciclo, ii
+            OPEN(unit=9,file=filename1,status='unknown') !crear y escribir en archivo
+            WRITE(9,*) 'x[m],y[m],z[m],Density_Contrast[g/cm**3]'
+
+            WRITE (filename2, '("output_jointGram_mg_minv_c",I1,"_iter",I1,".csv")' ) ciclo, ii
+            OPEN(unit=10,file=filename2,status='unknown') !crear y escribir en archivo
+            WRITE(10,*) 'x[m],y[m],z[m],Magnetization_Contrast[A/m]'
+
+            do jj = 1,n,1
+                  WRITE(9,'(F10.3,",",F11.3,",",F10.3,",",E11.4)') xcell(jj),ycell(jj),zcell(jj),mnew_h(jj)
+                  WRITE(10,'(F10.3,",",F11.3,",",F10.3,",",E11.4)') xcell(jj),ycell(jj),zcell(jj),mnew_h(n+jj)
+            end do
+
+            CLOSE(unit=9)
+            CLOSE(unit=10)
+
+            ! Escribir archivos de datos calculados a partir de modelos invertidos
+            WRITE (filename3, '("output_jointGram_gv_anomaly_c",I1,"_iter",I1,".csv")' ) ciclo, ii
+            OPEN(unit=11,file=filename3,status='unknown')
+            WRITE(11,*) 'x[m],y[m],z[m],gv[mGal]'
+
+            WRITE (filename4, '("output_jointGram_mg_anomaly_c",I1,"_iter",I1,".csv")' ) ciclo, ii
+            OPEN(unit=12,file=filename4,status='unknown')
+            WRITE(12,*) 'x[m],y[m],z[m],mg[nT]'
+
+            do kk = 1,m,1
+                  WRITE(11,'(F10.3,",",F11.3,",",F10.3,",",E11.4)') xobs(kk),yobs(kk),zobs_gv(kk),Am_h(kk)
+                  WRITE(12,'(F10.3,",",F11.3,",",F10.3,",",E11.4)') xobs(kk),yobs(kk),zobs_mg(kk),Am_h(m+kk)
+            end do
+
+            CLOSE(unit=11)
+            CLOSE(unit=12)
+            
+            ! Evaluar eficiencia.
+            call cpu_time(finish)
+            OPEN(unit=0,file='output_time.txt',status='old')
+            WRITE(0,*) 'Execution time: CPU part jointGram =', (finish-start), 'seg =', (finish-start)/60, 'min'
+
+      end if
+end do
+
+CLOSE(unit=16)
+
+
+! TERMINAR CALCULOS EN GPU
+istat = cublasDestroy(h)
+if (istat .ne. 0) print *,"cublasDestroy returned ",istat
+
+deallocate ( dx_d,dy_d,dz_d)
+deallocate ( xobs,yobs,zobs_gv,zobs_mg,xcell,ycell,zcell,d_gv,d_mg )
+
+!close(unit=0)
+
+return
+end subroutine jointGramPL3
+!*******************************************************************************
+
+
+ subroutine jointGramPL4(m,n,nx,ny,nz,step,xobs,yobs,zobs_gv,zobs_mg,xcell,ycell,zcell,d_gv,stdevd_gv,m_gv,stdevm_gv,mapr_gv,A_gv, &
+                        d_mg,stdevd_mg,m_mg,stdevm_mg,mapr_mg,A_mg,param_reg,dip,strike,num_iters,err0,ciclo)
+! Subrutina que calcula inversion conjunta de dos modelos gravimétrico y magnético
+! considerando similitud estructural evaluada por gradientes cruzados implementada mediante el enfoque Gramiano.
+! Procesamiento en CPU y GPU optimizado, balance entre uso de memorias RAM y VRAM.
+
+use cudafor
+use cublas_v2
+use iso_fortran_env , dp => real64
+use auxiliar, only: partialder, laplaciano
+
+implicit none
+
+integer, value :: m, n
+integer, intent(in) :: num_iters, nx, ny, nz, ciclo
+real, intent(in) :: step, err0, dip, strike
+real, dimension(10) :: param_reg
+!real, intent(in), dimension(nx*ny) :: zobs_gv, zobs_mg
+!real, intent(in), dimension(nx*ny) :: d_gv, d_mg, stdevd_gv, stdevd_mg
+!real, intent(in), dimension(nx*ny*nz) :: m_gv, m_mg, mapr_gv, mapr_mg, stdevm_gv, stdevm_mg
+!real(dp), intent(in), dimension(nx*ny,nx*ny*nz) :: A_gv, A_mg
+real, allocatable, dimension (:) :: xobs, yobs, zobs_gv, zobs_mg, xcell, ycell, zcell
+real, allocatable, dimension(:) :: d_gv, d_mg, stdevd_gv, stdevd_mg, m_gv, m_mg, mapr_gv, mapr_mg, stdevm_gv, stdevm_mg
+real(dp), allocatable, dimension(:,:) :: A_gv, A_mg
+
+real(dp), allocatable, dimension(:,:) :: dx, dy, dz, opL, opM
+real(dp), allocatable, dimension(:,:) :: aL2, gM2, eN2
+real(dp), allocatable, dimension(:,:) :: bWm2, Wd2, ATWd2, ATWd2A
+real(dp) :: Ia_gv_h(n,n), Ia_mg_h(n,n)
+
+real(dp), device, dimension(10) :: param_reg_d
+real(dp), device, allocatable, dimension(:,:) :: dx_d, dy_d, dz_d, dum1, dum2
+real(dp), device, allocatable, dimension(:) :: dum3, dum4
+real(dp), device, allocatable, dimension(:,:) :: Wd2_d, ATWd2_d, A_d
+
+real(dp), device :: Ia_gv(n,n), Ia_mg(n,n)
+real(dp), device, dimension(2*n) :: Ib, mn_d
+
+real(dp), device, allocatable, dimension(:) :: dxm1, dym1, dzm1, dxm2, dym2, dzm2, ter1, ter2, ter3, diva, divb, divc, dive, &
+                                               ax, ay, az, bx, by, bz, cx, cy, cz, ex, ey, ez, &
+                                               dxI1, dyI1, dzI1, dxI2, dyI2, dzI2, ter1J, ter2J
+real(dp), device, allocatable, dimension(:) :: mIg, mJg, I_new
+
+real(dp), dimension(2*n) :: mJg_h, I_new_h, I, Iconj_new, Iconj, kn_2a
+real(dp) :: kn_1, kn_2b, kn_2c, kn
+real(dp), dimension(2*n) :: m_new
+real(dp) :: Am(2*m), dr(2*m), mn_h(2*n)
+
+real :: conv_gv, conv_mg, rms_gv, rms_mg
+real :: Wd_gv(m), Wd_mg(m)
+integer, value :: ii, jj, kk
+character(len=42) :: filename00, filename1, filename2, filename3, filename4
+real :: start, finish
+
+!variables extra para paralelizar
+type(cublasHandle) :: h
+type(cudaDeviceProp) :: prop
+integer :: istat, n_threads, n_blocks
+real(dp) :: ALPHA=1.0 , BETA=0.0
+
+!**********************
+! INICIAR CALCULOS EN GPU
+istat = cublasCreate(h)
+if (istat .ne. 0) print *,"cublasCreate returned ",istat
+print*, 'Inicia calculo de modelos en GPU'
+
+!Evaluar eficiencia.
+call cpu_time(start)
+
+
+!***********************
+!reservar memoria para arreglos temporales, comentados porque son arreglos heredados del programa principal
+!allocate ( d_gv(m),d_mg(m),mapr_gv(n),mapr_mg(n),m_gv(n),m_mg(n),stdevd_gv(m),stdevd_mg(m),stdevm_gv(n),stdevm_mg(n), &
+!           A_gv(m,n),A_mg(m,n),xcell(n), ycell(n), zcell(n), xobs(m), yobs(m), zobs_gv(m), zobs_mg(m) )
+allocate ( dx(n,n),dy(n,n),dz(n,n),opL(n,n),opM(n,n),dx_d(n,n),dy_d(n,n),dz_d(n,n) )
+
+!matrices para derivadas
+call partialder(nx,ny,nz,step,'x',dx)
+call partialder(nx,ny,nz,step,'y',dy)
+call partialder(nx,ny,nz,step,'z',dz)
+dx_d = dx
+dy_d = dy
+dz_d = dz
+
+!Operador Suavidad
+call laplaciano(nx,ny,nz,step,opL)
+
+!Operador variacion horizontal total
+opM = dx*cos(dip)*cos(strike) + dy*cos(dip)*sin(strike) + dz*sin(dip)
+
+!Operador variacion vertical
+!opN = dz
+param_reg_d = param_reg
+
+deallocate(dx,dy,dz)
+
+
+!***********************
+!para gv
+allocate ( aL2(n,n),gM2(n,n),eN2(n,n),bWm2(n,n),Wd2(m,m),ATWd2(n,m),ATWd2A(n,n) )
+allocate ( dum1(n,n),dum2(n,n),dum3(n),dum4(m),Wd2_d(m,m),ATWd2_d(n,m),A_d(m,n) )
+
+!opL2 = MATMUL(transpose(opL),opL)
+dum1 = opL
+ALPHA = param_reg_d(1)
+istat = cublasDgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,n,n,n,ALPHA,dum1,n,dum1,n,BETA,dum2,n)
+aL2 = dum2
+
+!opM2 = MATMUL(transpose(opM),opM)
+dum1 = opM ; dum2 = 0
+ALPHA = param_reg_d(5)
+istat = cublasDgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,n,n,n,ALPHA,dum1,n,dum1,n,BETA,dum2,n)
+gM2 = dum2
+
+!opN2 = MATMUL(transpose(opN),opN)
+dum1 = dz_d ; dum2 = 0
+ALPHA = param_reg_d(7)
+istat = cublasDgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,n,n,n,ALPHA,dum1,n,dum1,n,BETA,dum2,n)
+eN2 = dum2
+
+!Calculando matrices de pesos W
+!call cov(n,1,stdevm_gv,Wm2)
+dum3 = stdevm_gv ; dum2 = 0
+!$cuf kernel do(2) <<< *,* >>>  !kernel loop directives (CUF kernels)
+do ii = 1, n
+  do jj = 1, n
+    if (ii == jj) then
+      dum2(ii,jj) = param_reg_d(3) * (1/(dum3(ii)**2))
+    else
+      dum2(ii,jj) = 0
+    end if
+  end do
+end do
+bWm2 = dum2
+
+!call cov(m,1,stdevd_gv,Wd2)
+dum4 = stdevd_gv
+!$cuf kernel do(2) <<< *,* >>>  !kernel loop directives (CUF kernels)
+do ii = 1, m
+  do jj = 1, m
+    if (ii == jj) then
+      Wd2_d(ii,jj) = 1/(dum4(ii)**2)
+    else
+      Wd2_d(ii,jj) = 0
+    end if
+  end do
+end do
+Wd2 = Wd2_d
+!Recordar W**2 = C-1 = 1/(stdev**2) = 1/varianza (type=1). Pesos W son 1/stdev (type=2).
+Wd_gv = 1/stdevd_gv
+
+A_d = A_gv
+ALPHA = 1.0
+!ATWd2 = MATMUL(transpose(A_gv),Wd2)
+istat = cublasDgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,size(A_d,2),size(Wd2_d,2),size(A_d,1),ALPHA, &
+                    A_d,size(A_d,1),Wd2_d,size(Wd2_d,1),BETA,ATWd2_d,size(ATWd2_d,1))
+ATWd2 = ATWd2_d ; dum1 = 0
+!ATWd2A = MATMUL(ATWd2,A_gv)
+istat = cublasDgemm(h,CUBLAS_OP_N,CUBLAS_OP_N,size(ATWd2_d,1),size(A_d,2),size(ATWd2_d,2),ALPHA, &
+                    ATWd2_d,size(ATWd2_d,1),A_d,size(A_d,1),BETA,dum1,size(dum1,1))
+ATWd2A = dum1
+
+!Para calcular direccion de descenso I(m)
+Ia_gv_h = ATWd2A + aL2 + bWm2 + gM2 + eN2
+Ia_gv = Ia_gv_h
+
+
+!Ib(1:n) = MATMUL(ATWd2,d_gv) + MATMUL(bWm2,mapr_gv)
+dum4 = d_gv
+dum3 = mapr_gv
+BETA = 0.0
+istat = cublasDgemv(h,CUBLAS_OP_N,size(ATWd2_d,1),size(ATWd2_d,2),ALPHA,ATWd2_d,size(ATWd2_d,1),dum4,1,BETA, &
+                    Ib(1:n),1)
+BETA = 1.0
+istat = cublasDgemv(h,CUBLAS_OP_N,size(dum2,1),size(dum2,2),ALPHA,dum2,size(dum2,1),dum3,1,BETA,Ib(1:n),1)
+
+mn_h(1:n) = m_gv
+mn_d(1:n) = m_gv
+deallocate (stdevd_gv,stdevm_gv,mapr_gv,m_gv)
+
+!**********************
+!para mg
+aL2=0; gM2=0; eN2=0; bWm2=0; Wd2=0; ATWd2=0; ATWd2A=0
+dum1=0; dum2=0; dum3=0; dum4=0; Wd2_d=0; ATWd2_d=0; A_d=0
+
+!opL2 = MATMUL(transpose(opL),opL)
+dum1 = opL
+ALPHA = param_reg_d(2)
+istat = cublasDgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,n,n,n,ALPHA,dum1,n,dum1,n,BETA,dum2,n)
+aL2 = dum2
+
+!opM2 = MATMUL(transpose(opM),opM)
+dum1 = opM ; dum2 = 0
+ALPHA = param_reg_d(6)
+istat = cublasDgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,n,n,n,ALPHA,dum1,n,dum1,n,BETA,dum2,n)
+gM2 = dum2
+
+!opN2 = MATMUL(transpose(opN),opN)
+dum1 = dz_d ; dum2 = 0
+ALPHA = param_reg_d(8)
+istat = cublasDgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,n,n,n,ALPHA,dum1,n,dum1,n,BETA,dum2,n)
+eN2 = dum2
+
+!Calculando matrices de pesos W
+!call cov(n,1,stdevm_mg,Wm2)
+dum3 = stdevm_mg ; dum2 = 0
+!$cuf kernel do(2) <<< *,* >>>  !kernel loop directives (CUF kernels)
+do ii = 1, n
+  do jj = 1, n
+    if (ii == jj) then
+      dum2(ii,jj) = param_reg_d(4) * (1/(dum3(ii)**2))
+    else
+      dum2(ii,jj) = 0
+    end if
+  end do
+end do
+bWm2 = dum2
+
+!call cov(m,1,stdevd_mg,Wd2)
+dum4 = stdevd_mg
+!$cuf kernel do(2) <<< *,* >>>  !kernel loop directives (CUF kernels)
+do ii = 1, m
+  do jj = 1, m
+    if (ii == jj) then
+      Wd2_d(ii,jj) = 1/(dum4(ii)**2)
+    else
+      Wd2_d(ii,jj) = 0
+    end if
+  end do
+end do
+Wd2 = Wd2_d
+!Recordar W**2 = C-1 = 1/(stdev**2) = 1/varianza (type=1). Pesos W son 1/stdev (type=2).
+Wd_mg = 1/stdevd_mg
+
+A_d = A_mg
+ALPHA = 1.0
+!ATWd2 = MATMUL(transpose(A_gv),Wd2)
+istat = cublasDgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,size(A_d,2),size(Wd2_d,2),size(A_d,1),ALPHA, &
+                    A_d,size(A_d,1),Wd2_d,size(Wd2_d,1),BETA,ATWd2_d,size(ATWd2_d,1))
+ATWd2 = ATWd2_d ; dum1 = 0
+!ATWd2A = MATMUL(ATWd2,A_gv)
+istat = cublasDgemm(h,CUBLAS_OP_N,CUBLAS_OP_N,size(ATWd2_d,1),size(A_d,2),size(ATWd2_d,2),ALPHA, &
+                    ATWd2_d,size(ATWd2_d,1),A_d,size(A_d,1),BETA,dum1,size(dum1,1))
+ATWd2A = dum1
+
+!Para calcular direccion de descenso I(m)
+Ia_mg_h = ATWd2A + aL2 + bWm2 + gM2 + eN2
+Ia_mg = Ia_mg_h
+
+!Ib(n+1:2*n) = MATMUL(ATWd2,d_gv) + MATMUL(bWm2,mapr_gv)
+dum4 = d_mg
+dum3 = mapr_mg
+BETA = 0.0
+istat = cublasDgemv(h,CUBLAS_OP_N,size(ATWd2_d,1),size(ATWd2_d,2),ALPHA,ATWd2_d,size(ATWd2_d,1),dum4,1,BETA, &
+                    Ib(n+1:2*n),1)
+BETA = 1.0
+istat = cublasDgemv(h,CUBLAS_OP_N,size(dum2,1),size(dum2,2),ALPHA,dum2,size(dum2,1),dum3,1,BETA,Ib(n+1:2*n),1)
+
+mn_h(n+1:2*n) = m_mg
+mn_d(n+1:2*n) = m_mg
+deallocate (stdevd_mg,stdevm_mg,mapr_mg,m_mg)
+deallocate (opL,opM,aL2,gM2,eN2,bWm2,Wd2,ATWd2,ATWd2A)
+deallocate (dum1,dum2,dum3,dum4,Wd2_d,ATWd2_d,A_d)
+
+
+!**********************
+allocate ( dxm1(n),dym1(n),dzm1(n),dxm2(n),dym2(n),dzm2(n),ter1(n),ter2(n),ter3(n),diva(n),divb(n),divc(n),dive(n), &
+           ax(n),ay(n),az(n),bx(n),by(n),bz(n),cx(n),cy(n),cz(n),ex(n),ey(n),ez(n), &
+           dxI1(n),dyI1(n),dzI1(n),dxI2(n),dyI2(n),dzI2(n),ter1J(n),ter2J(n) )
+allocate ( mIg(2*n), mJg(2*n), I_new(2*n) )
+
+
+WRITE (filename00, '("output_misfit_jointGram_c",I1,".txt")' ) ciclo
+OPEN(unit=16,file=filename00,status='unknown')
+WRITE(16,*) 'iteracion,convergencia%_gv,convergencia%_mg,RMS_gv,RMS_mg'
+
+!Método iterativo Gradiente Conjugado Regularizado RCG.
+conv_gv = 1e6 !error inicial (valor arbitrario grande)
+conv_mg = 1e6
+! Condicion de paro
+do ii = 1,num_iters,1 
+      if ((conv_gv > err0).and.(conv_mg > err0)) then
+            
+            !Definir numero de hilos y bloques para arreglos 1D
+            istat = cudaGetDeviceProperties(prop, 0)  ! Supongo que sólo se tiene acceso a una GPU
+            n_threads = prop%maxThreadsPerBlock
+            n_blocks  = ceiling(real(n)/n_threads)
+
+            !Preparativos para calcular I(m).
+            !matrices de derivadas con laplaciano
+            !dxm1 = MATMUL(dx,m_n(1:n))
+            !dym1 = MATMUL(dy,m_n(1:n))
+            !dzm1 = MATMUL(dz,m_n(1:n))
+            !dxm2 = MATMUL(dx,m_n(n+1:2*n))
+            !dym2 = MATMUL(dy,m_n(n+1:2*n))
+            !dzm2 = MATMUL(dz,m_n(n+1:2*n))
+            ALPHA = 1.
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),mn_d(1:n),1,BETA,dxm1,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),mn_d(1:n),1,BETA,dym1,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),mn_d(1:n),1,BETA,dzm1,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),mn_d(n+1:2*n),1,BETA,dxm2,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),mn_d(n+1:2*n),1,BETA,dym2,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),mn_d(n+1:2*n),1,BETA,dzm2,1)
+
+
+            !Ig
+            !ter1 = (dxm1*dxm2)+(dym1*dym2)+(dzm1*dzm2) !producto interno nabla_m1,nabla_m2
+            !ax = ter1*dxm2 !array operation
+            !ay = ter1*dym2
+            !az = ter1*dzm2
+            call prod<<<n_blocks,n_threads>>>(dxm1,dxm2,ter1,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dym1,dym2,ter1,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(dzm1,dzm2,ter1,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(ter1,dxm2,ax,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter1,dym2,ay,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter1,dzm2,az,1.,0.)
+          
+            !ter2 = (dxm2**2) + (dym2**2) + (dzm2**2) !modulo cuadrado de m2
+            !bx = ter2*dxm1 
+            !by = ter2*dym1
+            !bz = ter2*dzm1
+            call prod<<<n_blocks,n_threads>>>(dxm2,dxm2,ter2,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dym2,dym2,ter2,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(dzm2,dzm2,ter2,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(ter2,dxm1,bx,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter2,dym1,by,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter2,dzm1,bz,1.,0.)
+            
+            !cx = ter1*dxm1
+            !cy = ter1*dym1
+            !cz = ter1*dzm1
+            call prod<<<n_blocks,n_threads>>>(ter1,dxm1,cx,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter1,dym1,cy,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter1,dzm1,cz,1.,0.)
+
+            !ter3 = (dxm1**2) + (dym1**2) + (dzm1**2) !modulo cuadrado de m1
+            !ex = ter3*dxm2
+            !ey = ter3*dym2
+            !ez = ter3*dzm2
+            call prod<<<n_blocks,n_threads>>>(dxm1,dxm1,ter3,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dym1,dym1,ter3,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(dzm1,dzm1,ter3,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(ter3,dxm2,ex,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter3,dym2,ey,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter3,dzm2,ez,1.,0.)
+
+            !diva = MATMUL(dx,ax) + MATMUL(dy,ay) + MATMUL(dz,az)
+            !divb = MATMUL(dx,bx) + MATMUL(dy,by) + MATMUL(dz,bz)
+            !divc = MATMUL(dx,cx) + MATMUL(dy,cy) + MATMUL(dz,cz)
+            !dive = MATMUL(dx,ex) + MATMUL(dy,ey) + MATMUL(dz,ez)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),ax,1,BETA,diva,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),ay,1,BETA,diva,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),az,1,BETA,diva,1)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),bx,1,BETA,divb,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),by,1,BETA,divb,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),bz,1,BETA,divb,1)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),cx,1,BETA,divc,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),cy,1,BETA,divc,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),cz,1,BETA,divc,1)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),ex,1,BETA,dive,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),ey,1,BETA,dive,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),ez,1,BETA,dive,1)
+
+            !mIg(1:n) = param_reg_d(9) * (diva - divb)
+            !mIg(n+1:2*n) = param_reg_d(10) * (divc - dive)
+            
+            !$cuf kernel do <<<*,*>>>   !kernel loop directives (CUF kernels)
+            do kk = 1, n
+                  mIg(kk) = param_reg_d(9) * (diva(kk) - divb(kk))
+                  mIg(n+kk) = param_reg_d(10) * (divc(kk) - dive(kk))
+            enddo
+
+            !Calculando direccion de ascenso I(m) por descenso más pronunciado. 
+            !I_new = mIg - Ib
+            !$cuf kernel do <<<*,*>>>   !kernel loop directives (CUF kernels)
+            do kk = 1, 2*n
+                  I_new(kk) = mIg(kk) - Ib(kk)
+            enddo
+            !I_new = MATMUL(I_a,m_n) + (mI_G - I_b)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(Ia_gv,1),size(Ia_gv,2),ALPHA,Ia_gv,size(Ia_gv,1),mn_d(1:n),1,BETA,&
+                                I_new(1:n),1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(Ia_mg,1),size(Ia_mg,2),ALPHA,Ia_mg,size(Ia_mg,1),mn_d(n+1:2*n),1,BETA,&
+                                I_new(n+1:2*n),1)
+
+            ! Bajar arreglos a host y subir separado para siguiente parte.
+            I_new_h = I_new !aqui podría iniciar una segunda hebra
+
+            !Reset variables temporales.
+            ax=0; ay=0; az=0; bx=0; by=0; bz=0; cx=0; cy=0; cz=0; ex=0; ey=0; ez=0
+            diva=0; divb=0; divc=0; dive=0
+
+            !Jg
+            !dxI1 = MATMUL(dx,I_new(1:n))
+            !dyI1 = MATMUL(dy,I_new(1:n))
+            !dzI1 = MATMUL(dz,I_new(1:n))
+            !dxI2 = MATMUL(dx,I_new(n+1:2*n))
+            !dyI2 = MATMUL(dy,I_new(n+1:2*n))
+            !dzI2 = MATMUL(dz,I_new(n+1:2*n))
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),I_new(1:n),1,BETA,dxI1,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),I_new(1:n),1,BETA,dyI1,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),I_new(1:n),1,BETA,dzI1,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),I_new(n+1:2*n),1,BETA,dxI2,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),I_new(n+1:2*n),1,BETA,dyI2,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),I_new(n+1:2*n),1,BETA,dzI2,1)
+
+            !ter1J = (dxm2*dxI1)+(dym2*dyI1)+(dzm2*dzI1) !producto interno nabla_m2,nabla_I
+            !axJ = ter1J*dxm2
+            !ayJ = ter1J*dym2
+            !azJ = ter1J*dzm2
+            call prod<<<n_blocks,n_threads>>>(dxm2,dxI1,ter1J,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dym2,dyI1,ter1J,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(dzm2,dzI1,ter1J,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(ter1J,dxm2,ax,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter1J,dym2,ay,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter1J,dzm2,az,1.,0.)           
+
+            !bxJ = ter2*dxI1
+            !byJ = ter2*dyI1
+            !bzJ = ter2*dzI1
+            call prod<<<n_blocks,n_threads>>>(ter2,dxI1,bx,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter2,dyI1,by,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter2,dzI1,bz,1.,0.)
+            
+            !ter2J = (dxm1*dxI2)+(dym1*dyI2)+(dzm1*dzI2) !producto interno nabla_m1,nabla_I
+            !cxJ = ter2J*dxm1
+            !cyJ = ter2J*dym1
+            !czJ = ter2J*dzm1
+            call prod<<<n_blocks,n_threads>>>(dxm1,dxI2,ter2J,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dym1,dyI2,ter2J,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(dzm1,dzI2,ter2J,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(ter2J,dxm1,cx,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter2J,dym1,cy,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter2J,dzm1,cz,1.,0.) 
+
+            !exJ = ter3*dxI2
+            !eyJ = ter3*dyI2
+            !ezJ = ter3*dzI2
+            call prod<<<n_blocks,n_threads>>>(ter3,dxI2,ex,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter3,dyI2,ey,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(ter3,dzI2,ez,1.,0.) 
+            
+            !divaJ = MATMUL(dx,axJ) + MATMUL(dy,ayJ) + MATMUL(dz,azJ)
+            !divbJ = MATMUL(dx,bxJ) + MATMUL(dy,byJ) + MATMUL(dz,bzJ)
+            !divcJ = MATMUL(dx,cxJ) + MATMUL(dy,cyJ) + MATMUL(dz,czJ)
+            !diveJ = MATMUL(dx,exJ) + MATMUL(dy,eyJ) + MATMUL(dz,ezJ)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),ax,1,BETA,diva,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),ay,1,BETA,diva,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),az,1,BETA,diva,1)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),bx,1,BETA,divb,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),by,1,BETA,divb,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),bz,1,BETA,divb,1)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),cx,1,BETA,divc,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),cy,1,BETA,divc,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),cz,1,BETA,divc,1)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),ex,1,BETA,dive,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),ey,1,BETA,dive,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),ez,1,BETA,dive,1)
+
+            !mJg(1:n) = param_reg_d(9) * (divaJ - divbJ)
+            !mJg(n+1:2*n) = param_reg_d(10) * (divcJ - diveJ)
+
+            !$cuf kernel do <<<*,*>>>   !kernel loop directives (CUF kernels)
+            do kk = 1, n
+                  mJg(kk) = param_reg_d(9) * (diva(kk) - divb(kk))
+                  mJg(n+kk) = param_reg_d(10) * (divc(kk) - dive(kk))
+            enddo
+
+            ! Bajar arreglos a host
+            mJg_h = mJg
+
+
+            ! Evaluar eficiencia.
+            call cpu_time(finish)
+            OPEN(unit=0,file='output_time.txt',status='old')
+            WRITE(0,*) 'Execution time: GPU part jointGram =', (finish-start), 'seg =', (finish-start)/60, 'min'
+            !print*, 'Calculo de errores y generacion de archivos de salida en CPU iteracion:', ii
+            call cpu_time(start)
+
+            
+            !Direccion de ascenso mediante gradientes conjugados.
+            if (ii == 1) then
+                  Iconj_new = I_new_h
+            else
+                  Iconj_new = I_new_h + ( (DOT_PRODUCT(I_new_h,I_new_h)/DOT_PRODUCT(I,I)) * Iconj )
+            end if
+
+
+            ! Tamaño de paso kn en la dirección I(m).
+            kn_1 = DOT_PRODUCT(Iconj_new,I_new_h)
+
+            kn_2a(1:n) = MATMUL(Ia_gv_h,Iconj_new(1:n))
+            kn_2a(n+1:2*n) = MATMUL(Ia_mg_h,Iconj_new(n+1:2*n))
+            
+            kn_2b = DOT_PRODUCT(Iconj_new,kn_2a)
+            kn_2c = DOT_PRODUCT(Iconj_new,mJg_h)
+
+            kn = kn_1 / (kn_2b + kn_2c +1e-10)  !para evitar divisiones por cero
+
+            !Calculo m_new
+            m_new = mn_h - (kn*Iconj_new) !array operation
+            ! Subir arreglos a device para siguiente iteracion
+            mn_d = m_new
+
+            !***************************
+            !Convergencia
+            conv_gv = 100 * SQRT( SUM( ((m_new(1:n)-mn_h(1:n))**2)/((mn_h(1:n)**2)+1e-10) )/n )
+            conv_mg = 100 * SQRT( SUM( ((m_new(n+1:2*n)-mn_h(n+1:2*n))**2)/((mn_h(n+1:2*n)**2)+1e-10) )/n )
+
+            !Actualizando variables para la siguiente iteración
+            mn_h = m_new
+            I = I_new_h
+            Iconj = Iconj_new
+
+
+            !Obteniendo datos calculados
+            Am(1:m) = MATMUL(A_gv,m_new(1:n))
+            Am(m+1:2*m) = MATMUL(A_mg,m_new(n+1:2*n))
+
+            !RMS
+            dr(1:m) = Am(1:m) - d_gv !array operation
+            dr(m+1:2*m) = Am(m+1:2*m) - d_mg
+            dr(1:m) = Wd_gv * dr(1:m) !array operation
+            dr(m+1:2*m) = Wd_mg * dr(m+1:2*m)
+
+            rms_gv = DOT_PRODUCT(dr(1:m),dr(1:m))
+            rms_gv = SQRT(rms_gv/m)
+
+            rms_mg = DOT_PRODUCT(dr(m+1:2*m),dr(m+1:2*m))
+            rms_mg = SQRT(rms_mg/m)
+
+            WRITE(16,'(I3,",",F14.4,",",F14.4,",",F10.4,",",F10.4)') ii,conv_gv,conv_mg,rms_gv,rms_mg
+
+            
+            !Escribir resultados
+            ! Escribir archivos de modelos invertidos
+            WRITE (filename1, '("output_jointGram_gv_minv_c",I1,"_iter",I1,".csv")' ) ciclo, ii
+            OPEN(unit=9,file=filename1,status='unknown') !crear y escribir en archivo
+            WRITE(9,*) 'x[m],y[m],z[m],Density_Contrast[g/cm**3]'
+
+            WRITE (filename2, '("output_jointGram_mg_minv_c",I1,"_iter",I1,".csv")' ) ciclo, ii
+            OPEN(unit=10,file=filename2,status='unknown') !crear y escribir en archivo
+            WRITE(10,*) 'x[m],y[m],z[m],Magnetization_Contrast[A/m]'
+
+            do jj = 1,n,1
+                  WRITE(9,'(F10.3,",",F11.3,",",F10.3,",",E11.4)') xcell(jj),ycell(jj),zcell(jj),m_new(jj)
+                  WRITE(10,'(F10.3,",",F11.3,",",F10.3,",",E11.4)') xcell(jj),ycell(jj),zcell(jj),m_new(n+jj)
+            end do
+
+            CLOSE(unit=9)
+            CLOSE(unit=10)
+
+            ! Escribir archivos de datos calculados a partir de modelos invertidos
+            WRITE (filename3, '("output_jointGram_gv_anomaly_c",I1,"_iter",I1,".csv")' ) ciclo, ii
+            OPEN(unit=11,file=filename3,status='unknown') !crear y escribir en archivo
+            WRITE(11,*) 'x[m],y[m],z[m],g[mGal]'
+
+            WRITE (filename4, '("output_jointGram_mg_anomaly_c",I1,"_iter",I1,".csv")' ) ciclo, ii
+            OPEN(unit=12,file=filename4,status='unknown') !crear y escribir en archivo
+            WRITE(12,*) 'x[m],y[m],z[m],m[nT]'
+
+            do kk = 1,m,1
+                  WRITE(11,'(F10.3,",",F11.3,",",F10.3,",",E11.4)') xobs(kk),yobs(kk),zobs_gv(kk),Am(kk)
+                  WRITE(12,'(F10.3,",",F11.3,",",F10.3,",",E11.4)') xobs(kk),yobs(kk),zobs_mg(kk),Am(m+kk)
+            end do
+
+            CLOSE(unit=11)
+            CLOSE(unit=12)
+            
+            ! Evaluar eficiencia.
+            call cpu_time(finish)
+            OPEN(unit=0,file='output_time.txt',status='old')
+            WRITE(0,*) 'Execution time: CPU part jointGram =', (finish-start), 'seg =', (finish-start)/60, 'min'
+
+      end if
+end do
+
+CLOSE(unit=16)
+
+
+! TERMINAR CALCULOS EN GPU
+istat = cublasDestroy(h)
+if (istat .ne. 0) print *,"cublasDestroy returned ",istat
+
+deallocate ( dxm1,dym1,dzm1,dxm2,dym2,dzm2,ter1,ter2,ter3,diva,divb,divc,dive,ax,ay,az,bx,by,bz,cx,cy,cz,ex,ey,ez, &
+             dxI1,dyI1,dzI1,dxI2,dyI2,dzI2,ter1J,ter2J )
+deallocate ( dx_d,dy_d,dz_d,mIg,mJg,I_new)
+deallocate ( A_gv,A_mg,d_gv,d_mg )
+
+!close(unit=0)
+
+return
+end subroutine jointGramPL4
+!*******************************************************************************
+
+
+
+!*******************************************************************************
+subroutine jointGram5(m,n,nx,ny,nz,step,xobs,yobs,zobs_gv,zobs_mg,xcell,ycell,zcell,d_gv,stdevd_gv,m_gv,stdevm_gv,mapr_gv,A_gv, &
+                     d_mg,stdevd_mg,m_mg,stdevm_mg,mapr_mg,A_mg,param_reg,dip,strike,num_iters,err0,ciclo)
+! Subrutina que calcula inversion conjunta de dos modelos gravimétrico y magnético
+! considerando similitud estructural evaluada por gradientes cruzados implementada mediante el enfoque Gramiano.
+
+use,intrinsic :: ieee_arithmetic
+use iso_fortran_env , dp => real64
+use auxiliar, only: cov, partialder, laplaciano, coord_voxel
+!use model_ini, only: quasi_inf
+
+implicit none
+
+integer, value :: m, n 
+integer, intent(in) :: num_iters, nx, ny, nz, ciclo
+real, intent(in) :: step, err0, dip, strike
+real, dimension(10) :: param_reg
+!real, intent(in), dimension(nx*ny) :: zobs_gv, zobs_mg
+!real, intent(in), dimension(nx*ny) :: d_gv, d_mg, stdevd_gv, stdevd_mg
+!real, intent(in), dimension(nx*ny*nz) :: m_gv, m_mg, mapr_gv, mapr_mg, stdevm_gv, stdevm_mg
+!real(dp), intent(in), dimension(nx*ny,nx*ny*nz) :: A_gv, A_mg
+real, allocatable, dimension (:) :: xobs, yobs, zobs_gv, zobs_mg, xcell, ycell, zcell
+real, allocatable, dimension(:) :: d_gv, d_mg, stdevd_gv, stdevd_mg, m_gv, m_mg, mapr_gv, mapr_mg, stdevm_gv, stdevm_mg
+real(dp), allocatable, dimension(:,:) :: A_gv, A_mg
+
+real(dp), allocatable, dimension(:,:) :: dx, dy, dz
+real(dp), allocatable, dimension(:,:) :: opL, opM, opL2, opM2, opN2
+
+real, allocatable, dimension(:,:) :: aL2, gM2, eN2
+real, allocatable, dimension(:,:) :: bWm2, Wd2, ATWd2, ATWd2A
+real(dp), dimension(n,n) :: Ia_gv, Ia_mg
+real(dp), dimension(2*n) :: Ib
+
+real, allocatable, dimension(:) :: dxm1, dym1, dzm1, dxm2, dym2, dzm2, diva, divb, divc, dive, &
+                                   ter1, ter2, ter3, dum6, dum7, dum8, ter1J, ter2J, &
+                                   dxI1, dyI1, dzI1, dxI2, dyI2, dzI2
+
+real(dp), allocatable, dimension(:) :: mIg, mJg, I_new, I, Iconj_new, Iconj, kn_2a
+real(dp) :: kn_1, kn_2b, kn_2c, kn
+real :: Am(2*m), dr(2*m), m_n(2*n), m_new(2*n)
+
+real :: conv_gv, conv_mg, rms_gv, rms_mg
+real :: Wd_gv(m), Wd_mg(m)
+integer :: ii, jj, kk
+character(len=42) :: filename00, filename1, filename2, filename3, filename4, filename5
+real :: start, finish
+
+!Evaluar eficiencia.
+call cpu_time(start)
+PRINT*, 'Inicia calculo de modelos en CPU'
+
+!*****************************************
+!reservar memoria para arreglos temporales
+!allocate ( d_gv(m),d_mg(m),stdevd_gv(m),stdevd_mg(m),m_gv(n),m_mg(n),mapr_gv(n),mapr_mg(n),stdevm_gv(n),stdevm_mg(n), &
+!          A_gv(m,n),A_mg(m,n),xcell(n), ycell(n), zcell(n), xobs(m), yobs(m), zobs_gv(m), zobs_mg(m) )
+allocate ( dx(n,n),dy(n,n),dz(n,n),opL(n,n),opM(n,n),opL2(n,n),opM2(n,n),opN2(n,n) )
+
+!matrices para derivadas
+call partialder(nx,ny,nz,step,'x',dx)
+call partialder(nx,ny,nz,step,'y',dy)
+call partialder(nx,ny,nz,step,'z',dz)
+
+!Operador Suavidad
+call laplaciano(nx,ny,nz,step,opL)
+opL2 = MATMUL(transpose(opL),opL)
+
+!Operador variacion horizontal total
+opM = dx*cos(dip)*cos(strike) + dy*cos(dip)*sin(strike) + dz*sin(dip)
+opM2 = MATMUL(transpose(opM),opM)
+
+!Operador variacion vertical
+!opN = dz
+opN2 = MATMUL(transpose(dz),dz)
+
+deallocate(opL,opM)
+
+
+!***********************
+!para gv
+allocate ( aL2(n,n),gM2(n,n),eN2(n,n),bWm2(n,n),Wd2(m,m),ATWd2(n,m),ATWd2A(n,n) )
+
+!Calculando matrices de pesos W
+do ii = 1, n
+  do jj = 1, n
+    if (ii == jj) then
+      bWm2(ii,jj) = param_reg(3) * (1/(stdevm_gv(ii)**2))
+    else
+      bWm2(ii,jj) = 0
+    end if
+  end do
+end do
+
+do ii = 1, m
+  do jj = 1, m
+    if (ii == jj) then
+      Wd2(ii,jj) = 1/(stdevd_gv(ii)**2)
+    else
+      Wd2(ii,jj) = 0
+    end if
+  end do
+end do
+!Recordar W**2 = C-1 = 1/(stdev**2) = 1/varianza (type=1). Pesos W son 1/stdev (type=2).
+Wd_gv = 1/stdevd_gv
+
+!operadores al cuadrado, pesados por parametros regularizadores
+aL2 = param_reg(1) * opL2
+gM2 = param_reg(5) * opM2
+eN2 = param_reg(7) * opN2
+
+ATWd2 = MATMUL(transpose(A_gv),Wd2)
+!do ii = 1, n
+!  do jj = 1, m
+!      if (IEEE_IS_NAN(ATWd2(ii,jj))) ATWd2(ii,jj) = 0
+!  end do
+!end do
+!print*, ATWd2
+ATWd2A = MATMUL(ATWd2,A_gv)
+!do ii = 1, n
+!  do jj = 1, n
+!      if (IEEE_IS_NAN(ATWd2A(ii,jj))) ATWd2A(ii,jj) = 0
+!  end do
+!end do
+
+!Para calcular direccion de descenso I(m)
+Ia_gv = ATWd2A + aL2 + bWm2 + gM2 + eN2            
+Ib(1:n) = MATMUL(ATWd2,d_gv) + MATMUL(bWm2,mapr_gv)
+
+m_n(1:n) = m_gv
+deallocate(stdevm_gv,stdevd_gv,mapr_gv,m_gv)
+
+!**********************
+!para mg
+aL2=0; gM2=0; eN2=0; bWm2=0; Wd2=0; ATWd2=0; ATWd2A=0
+
+!Calculando matrices de pesos W
+do ii = 1, n
+  do jj = 1, n
+    if (ii == jj) then
+      bWm2(ii,jj) = param_reg(4) * (1/(stdevm_mg(ii)**2))
+    else
+      bWm2(ii,jj) = 0
+    end if
+  end do
+end do
+
+do ii = 1, m
+  do jj = 1, m
+    if (ii == jj) then
+      Wd2(ii,jj) = 1/(stdevd_mg(ii)**2)
+    else
+      Wd2(ii,jj) = 0
+    end if
+  end do
+end do
+!Recordar W**2 = C-1 = 1/(stdev**2) = 1/varianza (type=1). Pesos W son 1/stdev (type=2).
+Wd_mg = 1/stdevd_mg
+
+!operadores al cuadrado, pesados por parametros regularizadores
+aL2 = param_reg(2) * opL2
+gM2 = param_reg(6) * opM2
+eN2 = param_reg(8) * opN2
+
+ATWd2 = MATMUL(transpose(A_mg),Wd2)
+!do ii = 1, n
+!  do jj = 1, m
+!      if (IEEE_IS_NAN(ATWd2(ii,jj))) ATWd2(ii,jj) = 0
+!  end do
+!end do
+ATWd2A = MATMUL(ATWd2,A_mg)
+!do ii = 1, n
+!  do jj = 1, n
+!      if (IEEE_IS_NAN(ATWd2A(ii,jj))) ATWd2A(ii,jj) = 0
+!  end do
+!end do
+
+!Para calcular direccion de descenso I(m)
+Ia_mg = ATWd2A + aL2 + bWm2 + gM2 + eN2            
+Ib(n+1:2*n) = MATMUL(ATWd2,d_mg) + MATMUL(bWm2,mapr_mg)
+
+m_n(n+1:2*n) = m_mg
+deallocate(stdevm_mg,stdevd_mg,mapr_mg,m_mg)
+
+deallocate (opL2,opM2,opN2,aL2,gM2,eN2,bWm2,Wd2,ATWd2,ATWd2A)
+
+
+!**********************
+allocate ( dxm1(n),dym1(n),dzm1(n),dxm2(n),dym2(n),dzm2(n),diva(n),divb(n),divc(n),dive(n), &
+           ter1(n),ter2(n),ter3(n),dum6(n),dum7(n),dum8(n),ter1J(n),ter2J(n), &
+           dxI1(n),dyI1(n),dzI1(n),dxI2(n),dyI2(n),dzI2(n) )
+allocate ( mIg(2*n), mJg(2*n),I_new(2*n), I(2*n),Iconj(2*n),Iconj_new(2*n),kn_2a(2*n) )
+
+
+WRITE (filename00, '("output_misfit_jointGram_c",I1,".txt")' ) ciclo
+OPEN(unit=16,file=filename00,status='unknown')
+WRITE(16,*) 'iteracion,convergencia%_gv,convergencia%_mg,RMS_gv,RMS_mg'
+
+!Método iterativo Gradiente Conjugado Regularizado RCG.
+conv_gv = 1e6 !error inicial (valor arbitrario grande)
+conv_mg = 1e6
+do ii = 1,num_iters,1
+      if ((conv_gv > err0).and.(conv_mg > err0)) then
+          
+            !Preparativos para calcular I(m). Enfoque, menos operaciones
+            !matrices de derivadas
+            dxm1 = MATMUL(dx,m_n(1:n))
+            dym1 = MATMUL(dy,m_n(1:n))
+            dzm1 = MATMUL(dz,m_n(1:n))
+            dxm2 = MATMUL(dx,m_n(n+1:2*n))
+            dym2 = MATMUL(dy,m_n(n+1:2*n))
+            dzm2 = MATMUL(dz,m_n(n+1:2*n))
+      
+            !Ig
+            ter1 = (dxm1*dxm2)+(dym1*dym2)+(dzm1*dzm2) !producto interno nabla_m1,nabla_m2
+            dum6=0; dum7=0; dum8=0
+            dum6 = ter1*dxm2 !array operation
+            dum7 = ter1*dym2
+            dum8 = ter1*dzm2
+            diva = MATMUL(dx,dum6) + MATMUL(dy,dum7) + MATMUL(dz,dum8)
+
+            dum6=0; dum7=0; dum8=0
+            dum6 = ter1*dxm1
+            dum7 = ter1*dym1
+            dum8 = ter1*dzm1
+            divc = MATMUL(dx,dum6) + MATMUL(dy,dum7) + MATMUL(dz,dum8)
+
+            ter2 = (dxm2**2) + (dym2**2) + (dzm2**2) !modulo cuadrado de m2
+            dum6=0; dum7=0; dum8=0
+            dum6 = ter2*dxm1 
+            dum7 = ter2*dym1
+            dum8 = ter2*dzm1
+            divb = MATMUL(dx,dum6) + MATMUL(dy,dum7) + MATMUL(dz,dum8)
+
+            ter3 = (dxm1**2) + (dym1**2) + (dzm1**2) !modulo cuadrado de m1
+            dum6=0; dum7=0; dum8=0
+            dum6 = ter3*dxm2
+            dum7 = ter3*dym2
+            dum8 = ter3*dzm2
+            dive = MATMUL(dx,dum6) + MATMUL(dy,dum7) + MATMUL(dz,dum8)
+
+            mIg(1:n) = param_reg(9) * (diva - divb)
+            mIg(n+1:2*n) = param_reg(10) * (divc - dive)
+
+
+            !Calculando direccion de ascenso I(m) por descenso más pronunciado.
+            I_new(1:n) = MATMUL(Ia_gv,m_n(1:n)) - Ib(1:n) + mIg(1:n)
+            I_new(n+1:2*n) = MATMUL(Ia_mg,m_n(n+1:2*n)) - Ib(n+1:2*n) + mIg(n+1:2*n)
+!do kk = 1, 2*n
+!      if (IEEE_IS_NAN(I_new(kk))) I_new(kk) = 0
+!end do
+
+            !Reset variables temporales.
+            diva=0; divb=0; divc=0; dive=0
+
+            !Jg
+            dxI1 = MATMUL(dx,I_new(1:n))
+            dyI1 = MATMUL(dy,I_new(1:n))
+            dzI1 = MATMUL(dz,I_new(1:n))
+            dxI2 = MATMUL(dx,I_new(n+1:2*n))
+            dyI2 = MATMUL(dy,I_new(n+1:2*n))
+            dzI2 = MATMUL(dz,I_new(n+1:2*n))
+
+            ter1J = (dxm2*dxI1)+(dym2*dyI1)+(dzm2*dzI1) !producto interno nabla_m2,nabla_I
+            dum6=0; dum7=0; dum8=0
+            dum6 = ter1J*dxm2
+            dum7 = ter1J*dym2
+            dum8 = ter1J*dzm2
+            diva = MATMUL(dx,dum6) + MATMUL(dy,dum7) + MATMUL(dz,dum8)
+
+            !ter2 = (dxm2**2) + (dym2**2) + (dzm2**2) !modulo cuadrado de m2
+            dum6=0; dum7=0; dum8=0            
+            dum6 = ter2*dxI1
+            dum7 = ter2*dyI1
+            dum8 = ter2*dzI1
+            divb = MATMUL(dx,dum6) + MATMUL(dy,dum7) + MATMUL(dz,dum8)
+
+            ter2J = (dxm1*dxI2)+(dym1*dyI2)+(dzm1*dzI2) !producto interno nabla_m1,nabla_I
+            dum6=0; dum7=0; dum8=0
+            dum6 = ter2J*dxm1
+            dum7 = ter2J*dym1
+            dum8 = ter2J*dzm1
+            divc = MATMUL(dx,dum6) + MATMUL(dy,dum7) + MATMUL(dz,dum8)
+
+            !ter3 = (dxm1**2) + (dym1**2) + (dzm1**2) !modulo cuadrado de m1
+            dum6=0; dum7=0; dum8=0
+            dum6 = ter3*dxI2
+            dum7 = ter3*dyI2
+            dum8 = ter3*dzI2
+            dive = MATMUL(dx,dum6) + MATMUL(dy,dum7) + MATMUL(dz,dum8)
+
+            mJg(1:n) = param_reg(9) * (diva - divb)
+            mJg(n+1:2*n) = param_reg(10) * (divc - dive)
+
+            !Direccion de ascenso mediante gradientes conjugados.
+            if (ii == 1) then
+                  Iconj_new = I_new
+            else
+                  Iconj_new = I_new + ( (DOT_PRODUCT(I_new,I_new)/DOT_PRODUCT(I,I)) * Iconj )
+            end if
+
+
+            ! Tamaño de paso kn en la dirección I_n.
+            kn_1 = DOT_PRODUCT(Iconj_new,I_new)
+
+            kn_2a(1:n) = MATMUL(Ia_gv,Iconj_new(1:n))
+            kn_2a(n+1:2*n) = MATMUL(Ia_mg,Iconj_new(n+1:2*n))
+!do kk = 1, 2*n
+!      if (IEEE_IS_NAN(kn_2a(kk))) kn_2a(kk) = 0
+!end do
+!print*, Ia_mg
+
+            kn_2b = DOT_PRODUCT(Iconj_new,kn_2a)
+            kn_2c = DOT_PRODUCT(Iconj_new,mJg)
+
+            kn = kn_1 / (kn_2b + kn_2c +1e-10) !para evitar divisiones por cero
+
+            !Calculo m_new
+            m_new = m_n - (kn*Iconj_new) !array operation
+
+            ! Condicion de paro
+            !Convergencia
+            conv_gv = 100 * SQRT( SUM( ((m_new(1:n)-m_n(1:n))**2)/((m_n(1:n)**2)+1e-10) )/n )
+            conv_mg = 100 * SQRT( SUM( ((m_new(n+1:2*n)-m_n(n+1:2*n))**2)/((m_n(n+1:2*n)**2)+1e-10) )/n )
+
+            !Actualizando variables para la siguiente iteración
+            m_n = m_new
+            I = I_new
+            Iconj = Iconj_new
+
+            !Obteniendo datos calculados
+            Am(1:m) = MATMUL(A_gv,m_new(1:n))
+            Am(m+1:2*m) = MATMUL(A_mg,m_new(n+1:2*n))
+!do kk = 1, 2*m
+!      if (IEEE_IS_NAN(Am(kk))) Am(kk) = 0
+!end do
+
+            !RMS
+            dr(1:m) = Am(1:m) - d_gv !array operation
+            dr(m+1:2*m) = Am(m+1:2*m) - d_mg
+            dr(1:m) = Wd_gv * dr(1:m) !array operation
+            dr(m+1:2*m) = Wd_mg * dr(m+1:2*m)
+
+            rms_gv = DOT_PRODUCT(dr(1:m),dr(1:m))
+            rms_gv = SQRT(rms_gv/m)
+
+            rms_mg = DOT_PRODUCT(dr(m+1:2*m),dr(m+1:2*m))
+            rms_mg = SQRT(rms_mg/m)
+            
+            WRITE(16,'(I3,",",F14.4,",",F14.4,",",F10.4,",",F10.4)') ii,conv_gv,conv_mg,rms_gv,rms_mg
+
+
+            !Escribir resultados
+            ! Escribir archivos de modelos invertidos
+            WRITE (filename1, '("output_jointGram_gv_minv_c",I1,"_iter",I2,".csv")' ) ciclo, ii
+            OPEN(unit=9,file=filename1,status='unknown') !crear y escribir en archivo
+            WRITE(9,*) 'x[m],y[m],z[m],Density_Contrast[g/cm**3]'
+
+            WRITE (filename2, '("output_jointGram_mg_minv_c",I1,"_iter",I2,".csv")' ) ciclo, ii
+            OPEN(unit=10,file=filename2,status='unknown') !crear y escribir en archivo
+            WRITE(10,*) 'x[m],y[m],z[m],Magnetization_Contrast[A/m]'
+
+            do jj = 1,n,1
+                  WRITE(9,'(F10.3,",",F11.3,",",F10.3,",",E11.4)') xcell(jj),ycell(jj),zcell(jj),m_new(jj)
+                  WRITE(10,'(F10.3,",",F11.3,",",F10.3,",",E11.4)') xcell(jj),ycell(jj),zcell(jj),m_new(n+jj)
+            end do
+
+            CLOSE(unit=9)
+            CLOSE(unit=10)
+
+            ! Escribir archivos de datos calculados a partir de modelos invertidos
+            WRITE (filename3, '("output_jointGram_gv_anomaly_c",I1,"_iter",I2,".csv")' ) ciclo, ii
+            OPEN(unit=11,file=filename3,status='unknown') !crear y escribir en archivo
+            WRITE(11,*) 'x[m],y[m],z[m],g[mGal]'
+
+            WRITE (filename4, '("output_jointGram_mg_anomaly_c",I1,"_iter",I2,".csv")' ) ciclo, ii
+            OPEN(unit=12,file=filename4,status='unknown') !crear y escribir en archivo
+            WRITE(12,*) 'x[m],y[m],z[m],m[nT]'
+
+            do jj = 1,m,1
+                  WRITE(11,'(F10.3,",",F11.3,",",F10.3,",",E11.4)') xobs(jj),yobs(jj),zobs_gv(jj),Am(jj)
+                  WRITE(12,'(F10.3,",",F11.3,",",F10.3,",",E11.4)') xobs(jj),yobs(jj),zobs_mg(jj),Am(m+jj)
+            end do
+
+            CLOSE(unit=11)
+            CLOSE(unit=12)
+
+
+      end if
+end do
+
+CLOSE(unit=16)
+
+! Evaluar eficiencia.
+call cpu_time(finish)
+
+OPEN(unit=0,file='output_time.txt',status='old')
+WRITE(0,*) 'Execution time: CPU jointGram =', (finish-start), 'seg =', (finish-start)/60, 'min'
+
+deallocate ( dxm1,dym1,dzm1,dxm2,dym2,dzm2,diva,divb,divc,dive, &
+             ter1,ter2,ter3,dum6,dum7,dum8,ter1J,ter2J, &
+             dxI1,dyI1,dzI1,dxI2,dyI2,dzI2 )
+deallocate ( dx,dy,dz,mIg,mJg,I_new)
+deallocate ( A_gv,A_mg,d_gv,d_mg, xobs,yobs,zobs_gv,zobs_mg,xcell,ycell,zcell )
+
+!close(unit=0)
+
+return
+end subroutine jointGram5
+!*******************************************************************************
+
+subroutine jointGramPL5(m,n,nx,ny,nz,step,xobs,yobs,zobs_gv,zobs_mg,xcell,ycell,zcell,d_gv,stdevd_gv,m_gv,stdevm_gv,mapr_gv,A_gv, &
+                        d_mg,stdevd_mg,m_mg,stdevm_mg,mapr_mg,A_mg,param_reg,dip,strike,num_iters,err0,ciclo)
+! Subrutina que calcula inversion conjunta de dos modelos gravimétrico y magnético
+! considerando similitud estructural evaluada por gradientes cruzados implementada mediante el enfoque Gramiano.
+! Empleando cuBlas en todo el proceso, calculo casi completamente en GPU, más rápido pero limitado a memoria VRAM de la tarjeta.
+
+use cudafor
+use cublas_v2
+use iso_fortran_env , dp => real64
+use auxiliar, only: partialder, laplaciano
+
+implicit none
+
+integer, value :: m, n
+integer, intent(in) :: num_iters, nx, ny, nz, ciclo
+real, intent(in) :: step, err0, dip, strike
+real, dimension(10) :: param_reg
+!real, intent(in), dimension(nx*ny) :: zobs_gv, zobs_mg
+!real, intent(in), dimension(nx*ny) :: d_gv, d_mg, stdevd_gv, stdevd_mg
+!real, intent(in), dimension(nx*ny*nz) :: m_gv, m_mg, mapr_gv, mapr_mg, stdevm_gv, stdevm_mg
+!real(dp), intent(in), dimension(nx*ny,nx*ny*nz) :: A_gv, A_mg
+real, allocatable, dimension (:) :: xobs, yobs, zobs_gv, zobs_mg, xcell, ycell, zcell
+real, allocatable, dimension(:) :: d_gv, d_mg, stdevd_gv, stdevd_mg, m_gv, m_mg, mapr_gv, mapr_mg, stdevm_gv, stdevm_mg
+real(dp), allocatable, dimension(:,:) :: A_gv, A_mg
+
+real(dp), allocatable, dimension(:,:) :: dx, dy, dz, opL, opM
+real(dp), device, allocatable, dimension(:,:) :: dx_d, dy_d, dz_d, opL_d, opM_d
+
+real(dp), device, dimension(10) :: param_reg_d
+real(dp), device, allocatable, dimension(:,:) :: aL2, gM2, eN2
+real(dp), device, allocatable, dimension(:,:) :: bWm2, Wd2_d
+real(dp), device, allocatable, dimension(:) :: d_d, mapr_d, stdevd_d, stdevm_d
+real(dp), device, allocatable, dimension(:,:) :: ATWd2, ATWd2A
+
+real(dp), device :: Agv_d(m,n), Amg_d(m,n), Ia_gv(n,n), Ia_mg(n,n)
+real(dp), device, dimension(2*n) :: Ib, mn_d, mn_new
+
+real(dp), device, allocatable, dimension(:) :: dxm1, dym1, dzm1, dxm2, dym2, dzm2, dum5, dum6, dum7, dum8, diva, divb, divc, dive,&
+                                               dxI1, dyI1, dzI1, dxI2, dyI2, dzI2
+
+real(dp), device, allocatable, dimension(:) :: mIg, mJg, I_new, I, Iconj, Iconj_new, kn_2a
+real(dp) :: kn_1, kn_2b, kn_2c, kn, Inew2, I2, resI
+real(dp), device, dimension(2*m) :: Am
+real(dp) :: Am_h(2*m), dr(2*m), mn_h(2*n), mnew_h(2*n)
+
+real :: conv_gv, conv_mg, rms_gv, rms_mg
+real :: Wd_gv(m), Wd_mg(m)
+integer, value :: ii, jj, kk
+character(len=42) :: filename00, filename1, filename2, filename3, filename4
+real :: start, finish
+
+!variables extra para paralelizar
+type(cublasHandle) :: h
+type(cudaDeviceProp) :: prop
+real(dp) :: ALPHA=1.0 , BETA=0.0
+integer :: istat, n_threads, n_blocks
+
+!**********************
+!Evaluar eficiencia.
+call cpu_time(start)
+
+! INICIAR CALCULOS EN GPU
+istat = cublasCreate(h)
+if (istat .ne. 0) print *,"cublasCreate returned ",istat
+print*, 'Inicia calculo de modelos en GPU'
+
+!Definir numero de hilos y bloques para arreglos 1D y 2D
+istat = cudaGetDeviceProperties(prop, 0)  ! Supongo que sólo se tiene acceso a una GPU
+n_threads = prop%maxThreadsPerBlock
+n_blocks  = ceiling(real(n)/n_threads)
+
+
+!***********************
+!reservar memoria para arreglos temporales, comentados porque son arreglos heredados del programa principal
+!allocate ( d_gv(m),d_mg(m),mapr_gv(n),mapr_mg(n),m_gv(n),m_mg(n),stdevd_gv(m),stdevd_mg(m),stdevm_gv(n),stdevm_mg(n), &
+!           A_gv(m,n),A_mg(m,n),xcell(n), ycell(n), zcell(n), xobs(m), yobs(m), zobs_gv(m), zobs_mg(m) )
+allocate ( dx(n,n),dy(n,n),dz(n,n),opL(n,n),opM(n,n),dx_d(n,n),dy_d(n,n),dz_d(n,n),opL_d(n,n),opM_d(n,n) )
+
+!matrices para derivadas
+call partialder(nx,ny,nz,step,'x',dx)
+call partialder(nx,ny,nz,step,'y',dy)
+call partialder(nx,ny,nz,step,'z',dz)
+dx_d = dx
+dy_d = dy
+dz_d = dz
+
+!Operador Suavidad
+call laplaciano(nx,ny,nz,step,opL)
+opL_d = opL
+
+!Operador variacion horizontal total
+opM = dx*cos(dip)*cos(strike) + dy*cos(dip)*sin(strike) + dz*sin(dip)
+opM_d = opM
+
+!Operador variacion vertical
+!opN = dz
+param_reg_d = param_reg
+
+deallocate(dx,dy,dz,opL,opM)
+
+
+!***********************
+!para gv
+allocate ( aL2(n,n),gM2(n,n),eN2(n,n),bWm2(n,n),Wd2_d(m,m),ATWd2(n,m),ATWd2A(n,n) )
+allocate ( d_d(m),mapr_d(n),stdevd_d(n),stdevm_d(n) )
+
+!opL2 = MATMUL(transpose(opL),opL)
+ALPHA = param_reg_d(1)
+istat = cublasDgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,n,n,n,ALPHA,opL_d,n,opL_d,n,BETA,aL2,n)
+
+!opM2 = MATMUL(transpose(opM),opM)
+ALPHA = param_reg_d(5)
+istat = cublasDgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,n,n,n,ALPHA,opM_d,n,opM_d,n,BETA,gM2,n)
+
+!opN2 = MATMUL(transpose(opN),opN)
+ALPHA = param_reg_d(7)
+istat = cublasDgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,n,n,n,ALPHA,dz_d,n,dz_d,n,BETA,eN2,n)
+
+!Calculando matrices de pesos W
+stdevm_d = stdevm_gv
+!$cuf kernel do(2) <<< *,* >>>  !kernel loop directives (CUF kernels)
+do ii = 1, n
+  do jj = 1, n
+    if (ii == jj) then
+      bWm2(ii,jj) = param_reg_d(3) * (1/(stdevm_d(ii)**2))
+    else
+      bWm2(ii,jj) = 0
+    end if
+  end do
+end do
+
+!call cov(m,1,stdevd_gv,Wd2)
+stdevd_d = stdevd_gv
+!$cuf kernel do(2) <<< *,* >>>  !kernel loop directives (CUF kernels)
+do ii = 1, m
+  do jj = 1, m
+    if (ii == jj) then
+      Wd2_d(ii,jj) = 1/(stdevd_d(ii)**2)
+    else
+      Wd2_d(ii,jj) = 0
+    end if
+  end do
+end do
+!Recordar W**2 = C-1 = 1/(stdev**2) = 1/varianza (type=1). Pesos W son 1/stdev (type=2).
+Wd_gv = 1/stdevd_gv
+
+Agv_d = A_gv
+ALPHA = 1.0
+!ATWd2 = MATMUL(transpose(A_gv),Wd2)
+istat = cublasDgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,size(Agv_d,2),size(Wd2_d,2),size(Agv_d,1),ALPHA, &
+                    Agv_d,size(Agv_d,1),Wd2_d,size(Wd2_d,1),BETA,ATWd2,size(ATWd2,1))
+!ATWd2A = MATMUL(ATWd2,A_gv)
+istat = cublasDgemm(h,CUBLAS_OP_N,CUBLAS_OP_N,size(ATWd2,1),size(Agv_d,2),size(ATWd2,2),ALPHA, &
+                    ATWd2,size(ATWd2,1),Agv_d,size(Agv_d,1),BETA,ATWd2A,size(ATWd2A,1))
+
+!Para calcular direccion de descenso I(m)
+!Ia_gv = ATWd2A + aL2 + bWm2 + gM2 + eN2
+!$cuf kernel do(2) <<< *,* >>>  !kernel loop directives (CUF kernels)
+do jj = 1, n
+      do ii = 1, n
+            Ia_gv(ii,jj) = ATWd2A(ii,jj) + aL2(ii,jj) + bWm2(ii,jj) + gM2(ii,jj) + eN2(ii,jj)
+      enddo
+enddo
+
+!Ib(1:n) = MATMUL(ATWd2,d_gv) + MATMUL(bWm2,mapr_gv)
+d_d = d_gv
+mapr_d = mapr_gv
+BETA = 0.0
+istat = cublasDgemv(h,CUBLAS_OP_N,size(ATWd2,1),size(ATWd2,2),ALPHA,ATWd2,size(ATWd2,1),d_d,1,BETA, &
+                    Ib(1:n),1)
+BETA = 1.0
+istat = cublasDgemv(h,CUBLAS_OP_N,size(bWm2,1),size(bWm2,2),ALPHA,bWm2,size(bWm2,1),mapr_d,1,BETA,Ib(1:n),1)
+
+mn_h(1:n) = m_gv
+mn_d(1:n) = m_gv
+deallocate(stdevm_gv,stdevd_gv,mapr_gv,m_gv,A_gv)
+
+!**********************
+!para mg
+aL2=0; gM2=0; eN2=0; bWm2=0; Wd2_d=0; ATWd2=0; ATWd2A=0
+
+!opL2 = MATMUL(transpose(opL),opL)
+ALPHA = param_reg_d(2)
+istat = cublasDgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,n,n,n,ALPHA,opL_d,n,opL_d,n,BETA,aL2,n)
+
+!opM2 = MATMUL(transpose(opM),opM)
+ALPHA = param_reg_d(6)
+istat = cublasDgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,n,n,n,ALPHA,opM_d,n,opM_d,n,BETA,gM2,n)
+
+!opN2 = MATMUL(transpose(opN),opN)
+ALPHA = param_reg_d(8)
+istat = cublasDgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,n,n,n,ALPHA,dz_d,n,dz_d,n,BETA,eN2,n)
+
+!Calculando matrices de pesos W
+stdevm_d = stdevm_mg
+!$cuf kernel do(2) <<< *,* >>>  !kernel loop directives (CUF kernels)
+do ii = 1, n
+  do jj = 1, n
+    if (ii == jj) then
+      bWm2(ii,jj) = param_reg_d(4) * (1/(stdevm_d(ii)**2))
+    else
+      bWm2(ii,jj) = 0
+    end if
+  end do
+end do
+
+!call cov(m,1,stdevd_mg,Wd2)
+stdevd_d = stdevd_mg
+!$cuf kernel do(2) <<< *,* >>>  !kernel loop directives (CUF kernels)
+do ii = 1, m
+  do jj = 1, m
+    if (ii == jj) then
+      Wd2_d(ii,jj) = 1/(stdevd_d(ii)**2)
+    else
+      Wd2_d(ii,jj) = 0
+    end if
+  end do
+end do
+!Recordar W**2 = C-1 = 1/(stdev**2) = 1/varianza (type=1). Pesos W son 1/stdev (type=2).
+Wd_mg = 1/stdevd_mg
+
+Amg_d = A_mg
+ALPHA = 1.0
+!ATWd2 = MATMUL(transpose(A_mg),Wd2)
+istat = cublasDgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,size(Amg_d,2),size(Wd2_d,2),size(Amg_d,1),ALPHA, &
+                    Amg_d,size(Amg_d,1),Wd2_d,size(Wd2_d,1),BETA,ATWd2,size(ATWd2,1))
+!ATWd2A = MATMUL(ATWd2,A_mg)
+istat = cublasDgemm(h,CUBLAS_OP_N,CUBLAS_OP_N,size(ATWd2,1),size(Amg_d,2),size(ATWd2,2),ALPHA, &
+                    ATWd2,size(ATWd2,1),Amg_d,size(Amg_d,1),BETA,ATWd2A,size(ATWd2A,1))
+
+!Para calcular direccion de descenso I(m)
+!Ia_mg = ATWd2A + aL2 + bWm2 + gM2 + eN2
+!$cuf kernel do(2) <<< *,* >>>  !kernel loop directives (CUF kernels)
+do jj = 1, n
+      do ii = 1, n
+            Ia_mg(ii,jj) = ATWd2A(ii,jj) + aL2(ii,jj) + bWm2(ii,jj) + gM2(ii,jj) + eN2(ii,jj)
+      enddo
+enddo
+
+!Ib(n+1:2*n) = MATMUL(ATWd2,d_mg) + MATMUL(bWm2,mapr_mg)
+d_d = d_mg
+mapr_d = mapr_mg
+BETA = 0.0
+istat = cublasDgemv(h,CUBLAS_OP_N,size(ATWd2,1),size(ATWd2,2),ALPHA,ATWd2,size(ATWd2,1),d_d,1,BETA, &
+                    Ib(n+1:2*n),1)
+BETA = 1.0
+istat = cublasDgemv(h,CUBLAS_OP_N,size(bWm2,1),size(bWm2,2),ALPHA,bWm2,size(bWm2,1),mapr_d,1,BETA,Ib(n+1:2*n),1)
+
+mn_h(n+1:2*n) = m_mg
+mn_d(n+1:2*n) = m_mg
+deallocate(stdevm_mg,stdevd_mg,mapr_mg,m_mg,A_mg)
+
+deallocate (opL_d,opM_d,aL2,gM2,eN2,bWm2,Wd2_d,ATWd2,ATWd2A)
+deallocate (d_d,mapr_d,stdevd_d,stdevm_d)
+
+!**********************
+allocate ( dxm1(n),dym1(n),dzm1(n),dxm2(n),dym2(n),dzm2(n),dum5(n),dum6(n),dum7(n),dum8(n),diva(n),divb(n),divc(n),dive(n), &
+           dxI1(n),dyI1(n),dzI1(n),dxI2(n),dyI2(n),dzI2(n) )
+allocate ( mIg(2*n), mJg(2*n),I_new(2*n), I(2*n),Iconj(2*n),Iconj_new(2*n),kn_2a(2*n) )
+
+
+WRITE (filename00, '("output_misfit_jointGram_c",I1,".txt")' ) ciclo
+OPEN(unit=16,file=filename00,status='unknown')
+WRITE(16,*) 'iteracion,convergencia%_gv,convergencia%_mg,RMS_gv,RMS_mg'
+
+!Método iterativo Gradiente Conjugado Regularizado RCG.
+conv_gv = 1e6 !error inicial (valor arbitrario grande)
+conv_mg = 1e6
+! Condicion de paro
+do ii = 1,num_iters,1 
+      if ((conv_gv > err0).and.(conv_mg > err0)) then
+            !n_blocks  = ceiling(real(n)/n_threads)
+
+            !Preparativos para calcular I(m). Enfoque, menos arreglos en memoria
+            !matrices de derivadas con laplaciano
+            !dxm1 = MATMUL(dx,m_n(1:n))
+            !dym1 = MATMUL(dy,m_n(1:n))
+            !dzm1 = MATMUL(dz,m_n(1:n))
+            !dxm2 = MATMUL(dx,m_n(n+1:2*n))
+            !dym2 = MATMUL(dy,m_n(n+1:2*n))
+            !dzm2 = MATMUL(dz,m_n(n+1:2*n))
+            ALPHA = 1.
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),mn_d(1:n),1,BETA,dxm1,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),mn_d(1:n),1,BETA,dym1,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),mn_d(1:n),1,BETA,dzm1,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),mn_d(n+1:2*n),1,BETA,dxm2,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),mn_d(n+1:2*n),1,BETA,dym2,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),mn_d(n+1:2*n),1,BETA,dzm2,1)
+
+
+            !Ig
+            !ter1 = (dxm1*dxm2)+(dym1*dym2)+(dzm1*dzm2) !producto interno nabla_m1,nabla_m2
+            dum5 = 0
+            call prod<<<n_blocks,n_threads>>>(dxm1,dxm2,dum5,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dym1,dym2,dum5,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(dzm1,dzm2,dum5,1.,1.)
+            !ax = ter1*dxm2 !array operation
+            !ay = ter1*dym2
+            !az = ter1*dzm2
+            dum6=0; dum7=0; dum8=0
+            call prod<<<n_blocks,n_threads>>>(dum5,dxm2,dum6,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dum5,dym2,dum7,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dum5,dzm2,dum8,1.,0.)
+            !diva = MATMUL(dx,ax) + MATMUL(dy,ay) + MATMUL(dz,az)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),dum6,1,BETA,diva,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),dum7,1,BETA,diva,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),dum8,1,BETA,diva,1)
+          
+            !cx = ter1*dxm1
+            !cy = ter1*dym1
+            !cz = ter1*dzm1
+            dum6=0; dum7=0; dum8=0
+            call prod<<<n_blocks,n_threads>>>(dum5,dxm1,dum6,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dum5,dym1,dum7,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dum5,dzm1,dum8,1.,0.)
+            !divc = MATMUL(dx,cx) + MATMUL(dy,cy) + MATMUL(dz,cz)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),dum6,1,BETA,divc,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),dum7,1,BETA,divc,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),dum8,1,BETA,divc,1)
+          
+            !ter2 = (dxm2**2) + (dym2**2) + (dzm2**2) !modulo cuadrado de m2
+            dum5 = 0
+            call prod<<<n_blocks,n_threads>>>(dxm2,dxm2,dum5,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dym2,dym2,dum5,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(dzm2,dzm2,dum5,1.,1.)
+            !bx = ter2*dxm1 
+            !by = ter2*dym1
+            !bz = ter2*dzm1
+            dum6=0; dum7=0; dum8=0
+            call prod<<<n_blocks,n_threads>>>(dum5,dxm1,dum6,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dum5,dym1,dum7,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dum5,dzm1,dum8,1.,0.)
+            !divb = MATMUL(dx,bx) + MATMUL(dy,by) + MATMUL(dz,bz)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),dum6,1,BETA,divb,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),dum7,1,BETA,divb,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),dum8,1,BETA,divb,1)
+            
+            !ter3 = (dxm1**2) + (dym1**2) + (dzm1**2) !modulo cuadrado de m1
+            dum5 = 0
+            call prod<<<n_blocks,n_threads>>>(dxm1,dxm1,dum5,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dym1,dym1,dum5,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(dzm1,dzm1,dum5,1.,1.)
+            !ex = ter3*dxm2
+            !ey = ter3*dym2
+            !ez = ter3*dzm2
+            dum6=0; dum7=0; dum8=0
+            call prod<<<n_blocks,n_threads>>>(dum5,dxm2,dum6,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dum5,dym2,dum7,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dum5,dzm2,dum8,1.,0.)
+            !dive = MATMUL(dx,ex) + MATMUL(dy,ey) + MATMUL(dz,ez)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),dum6,1,BETA,dive,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),dum7,1,BETA,dive,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),dum8,1,BETA,dive,1)
+
+
+            !mIg(1:n) = param_reg_d(9) * (diva - divb)
+            !mIg(n+1:2*n) = param_reg_d(10) * (divc - dive)
+            !$cuf kernel do <<<*,*>>>   !kernel loop directives (CUF kernels)
+            do kk = 1, n
+                  mIg(kk) = param_reg_d(9) * (diva(kk) - divb(kk))
+                  mIg(n+kk) = param_reg_d(10) * (divc(kk) - dive(kk))
+            enddo
+
+            !Calculando direccion de ascenso I(m) por descenso más pronunciado. 
+            !I_new = mIg - Ib            
+            !$cuf kernel do <<<*,*>>>   !kernel loop directives (CUF kernels)
+            do kk = 1, 2*n
+                  I_new(kk) = mIg(kk) - Ib(kk)
+            enddo
+            !I_new = MATMUL(I_a,m_n) + (mI_G - I_b)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(Ia_gv,1),size(Ia_gv,2),ALPHA,Ia_gv,size(Ia_gv,1),mn_d(1:n),1,BETA,&
+                                I_new(1:n),1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(Ia_mg,1),size(Ia_mg,2),ALPHA,Ia_mg,size(Ia_mg,1),mn_d(n+1:2*n),1,BETA,&
+                                I_new(n+1:2*n),1)
+
+
+            !Reset variables temporales.
+            diva=0; divb=0; divc=0; dive=0
+
+            !Jg
+            !dxI1 = MATMUL(dx,I_new(1:n))
+            !dyI1 = MATMUL(dy,I_new(1:n))
+            !dzI1 = MATMUL(dz,I_new(1:n))
+            !dxI2 = MATMUL(dx,I_new(n+1:2*n))
+            !dyI2 = MATMUL(dy,I_new(n+1:2*n))
+            !dzI2 = MATMUL(dz,I_new(n+1:2*n))
+            ALPHA = 1.
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),I_new(1:n),1,BETA,dxI1,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),I_new(1:n),1,BETA,dyI1,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),I_new(1:n),1,BETA,dzI1,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),I_new(n+1:2*n),1,BETA,dxI2,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),I_new(n+1:2*n),1,BETA,dyI2,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),I_new(n+1:2*n),1,BETA,dzI2,1)
+
+            !ter1J = (dxm2*dxI1)+(dym2*dyI1)+(dzm2*dzI1) !producto interno nabla_m2,nabla_I
+            dum5 = 0
+            call prod<<<n_blocks,n_threads>>>(dxm2,dxI1,dum5,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dym2,dyI1,dum5,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(dzm2,dzI1,dum5,1.,1.)
+            !axJ = ter1J*dxm2
+            !ayJ = ter1J*dym2
+            !azJ = ter1J*dzm2
+            dum6=0; dum7=0; dum8=0
+            call prod<<<n_blocks,n_threads>>>(dum5,dxm2,dum6,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dum5,dym2,dum7,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dum5,dzm2,dum8,1.,0.)           
+            !divaJ = MATMUL(dx,axJ) + MATMUL(dy,ayJ) + MATMUL(dz,azJ)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),dum6,1,BETA,diva,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),dum7,1,BETA,diva,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),dum8,1,BETA,diva,1)
+
+            !ter2 = (dxm2**2) + (dym2**2) + (dzm2**2) !modulo cuadrado de m2
+            dum5 = 0
+            call prod<<<n_blocks,n_threads>>>(dxm2,dxm2,dum5,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dym2,dym2,dum5,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(dzm2,dzm2,dum5,1.,1.)
+            !bxJ = ter2*dxI1
+            !byJ = ter2*dyI1
+            !bzJ = ter2*dzI1
+            dum6=0; dum7=0; dum8=0
+            call prod<<<n_blocks,n_threads>>>(dum5,dxI1,dum6,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dum5,dyI1,dum7,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dum5,dzI1,dum8,1.,0.)
+            !divbJ = MATMUL(dx,bxJ) + MATMUL(dy,byJ) + MATMUL(dz,bzJ)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),dum6,1,BETA,divb,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),dum7,1,BETA,divb,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),dum8,1,BETA,divb,1)
+            
+            !ter2J = (dxm1*dxI2)+(dym1*dyI2)+(dzm1*dzI2) !producto interno nabla_m1,nabla_I
+            dum5 = 0
+            call prod<<<n_blocks,n_threads>>>(dxm1,dxI2,dum5,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dym1,dyI2,dum5,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(dzm1,dzI2,dum5,1.,1.)
+            !cxJ = ter2J*dxm1
+            !cyJ = ter2J*dym1
+            !czJ = ter2J*dzm1
+            dum6=0; dum7=0; dum8=0
+            call prod<<<n_blocks,n_threads>>>(dum5,dxm1,dum6,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dum5,dym1,dum7,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dum5,dzm1,dum8,1.,0.) 
+            !divcJ = MATMUL(dx,cxJ) + MATMUL(dy,cyJ) + MATMUL(dz,czJ)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),dum6,1,BETA,divc,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),dum7,1,BETA,divc,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),dum8,1,BETA,divc,1)
+
+            !ter3 = (dxm1**2) + (dym1**2) + (dzm1**2) !modulo cuadrado de m1
+            dum5 = 0
+            call prod<<<n_blocks,n_threads>>>(dxm1,dxm1,dum5,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dym1,dym1,dum5,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(dzm1,dzm1,dum5,1.,1.)
+            !exJ = ter3*dxI2
+            !eyJ = ter3*dyI2
+            !ezJ = ter3*dzI2
+            dum6=0; dum7=0; dum8=0
+            call prod<<<n_blocks,n_threads>>>(dum5,dxI2,dum6,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dum5,dyI2,dum7,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dum5,dzI2,dum8,1.,0.) 
+            !diveJ = MATMUL(dx,exJ) + MATMUL(dy,eyJ) + MATMUL(dz,ezJ)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),dum6,1,BETA,dive,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),dum7,1,BETA,dive,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),dum8,1,BETA,dive,1)
+
+
+            !mJg(1:n) = param_reg_d(9) * (divaJ - divbJ)
+            !mJg(n+1:2*n) = param_reg_d(10) * (divcJ - diveJ)
+            !$cuf kernel do <<<*,*>>>   !kernel loop directives (CUF kernels)
+            do kk = 1, n
+                  mJg(kk) = param_reg_d(9) * (diva(kk) - divb(kk))
+                  mJg(n+kk) = param_reg_d(10) * (divc(kk) - dive(kk))
+            enddo
+          
+            !Direccion de ascenso mediante gradientes conjugados.
+            if (ii == 1) then
+                  Iconj_new = I_new
+            else
+                  !Iconj_new = I_new + ( (DOT_PRODUCT(I_new,I_new)/DOT_PRODUCT(I,I))*Iconj )
+                  istat = cublasDdot(h,size(I_new),I_new,1,I_new,1,Inew2)
+                  istat = cublasDdot(h,size(I),I,1,I,1,I2)
+                  resI = Inew2 / I2
+                  !$cuf kernel do <<<*,*>>>   !kernel loop directives (CUF kernels)
+                  do kk = 1, 2*n
+                        Iconj_new(kk) = I_new(kk) + resI*Iconj(kk)
+                  enddo
+            end if
+ 
+
+            ! Tamaño de paso kn en la dirección I(m).
+            !kn_1 = DOT_PRODUCT(Iconj_new,I_new)
+            istat = cublasDdot(h,size(Iconj_new),Iconj_new,1,I_new,1,kn_1)
+
+            !kn_2a(1:n) = MATMUL(Ia_gv,Iconj_new(1:n))
+            !kn_2a(n+1:2*n) = MATMUL(Ia_mg,Iconj_new(n+1:2*n))
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(Ia_gv,1),size(Ia_gv,2),ALPHA,Ia_gv,size(Ia_gv,1),Iconj_new(1:n),1,BETA, &
+                                kn_2a(1:n),1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(Ia_mg,1),size(Ia_mg,2),ALPHA,Ia_mg,size(Ia_mg,1),Iconj_new(n+1:2*n),1,BETA, &
+                                kn_2a(n+1:2*n),1)
+            
+            !kn_2b = DOT_PRODUCT(Iconj_new,kn_2a)
+            istat = cublasDdot(h,size(Iconj_new),Iconj_new,1,kn_2a,1,kn_2b)
+           
+            !kn_2c = DOT_PRODUCT(Iconj_new,mJg_h)
+            istat = cublasDdot(h,size(Iconj_new),Iconj_new,1,mJg,1,kn_2c)
+
+            kn = kn_1 / (kn_2b + kn_2c +1e-10)  !para evitar divisiones por cero
+
+            !Calculo mn_new
+            !mn_new = mn_d - (kn*Iconj_new)
+            !$cuf kernel do <<<*,*>>>   !kernel loop directives (CUF kernels)
+            do kk = 1, 2*n
+                  mn_new(kk) = mn_d(kk) - (kn*Iconj_new(kk))
+            enddo
+
+            !Actualizando variables para la siguiente iteración
+            mn_d = mn_new
+            I = I_new
+            Iconj = Iconj_new
+
+            !Obteniendo datos calculados
+            !Am(1:m) = MATMUL(A_gv,mn_new(1:n))
+            !Am(m+1:2*m) = MATMUL(A_mg,mn_new(n+1:2*n))
+            ALPHA = 1.0
+            BETA = 0.0
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(Agv_d,1),size(Agv_d,2),ALPHA,Agv_d,size(Agv_d,1),mn_new(1:n),1,BETA,Am(1:m),1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(Amg_d,1),size(Amg_d,2),ALPHA,Amg_d,size(Amg_d,1),mn_new(n+1:2*n),1,BETA, &
+                                Am(m+1:2*m),1)
+
+            !Bajar  arreglos a Host
+            mnew_h = mn_new
+            Am_h = Am
+
+            ! Evaluar eficiencia.
+            call cpu_time(finish)
+            OPEN(unit=0,file='output_time.txt',status='old')
+            WRITE(0,*) 'Execution time: GPU part jointGram =', (finish-start), 'seg =', (finish-start)/60, 'min'
+            !print*, 'Calculo de errores y generacion de archivos de salida en CPU iteracion:', ii
+            call cpu_time(start)
+
+            !***************************
+            !Convergencia
+            conv_gv = 100 * SQRT( SUM( ((mnew_h(1:n)-mn_h(1:n))**2)/((mn_h(1:n)**2)+1e-10) )/n )
+            conv_mg = 100 * SQRT( SUM( ((mnew_h(n+1:2*n)-mn_h(n+1:2*n))**2)/((mn_h(n+1:2*n)**2)+1e-10) )/n )
+            mn_h = mnew_h
+          
+            !RMS
+            dr(1:m) = Am_h(1:m) - d_gv !array operation
+            dr(m+1:2*m) = Am_h(m+1:2*m) - d_mg
+            dr(1:m) = Wd_gv * dr(1:m)
+            dr(m+1:2*m) = Wd_mg * dr(m+1:2*m)
+
+            rms_gv = DOT_PRODUCT(dr(1:m),dr(1:m))
+            rms_gv = SQRT(rms_gv/m)
+
+            rms_mg = DOT_PRODUCT(dr(m+1:2*m),dr(m+1:2*m))
+            rms_mg = SQRT(rms_mg/m)
+
+            !Escribir resultados
+            WRITE(16,'(I3,",",F14.4,",",F14.4,",",F10.4,",",F10.4)') ii,conv_gv,conv_mg,rms_gv,rms_mg
+
+            ! Escribir archivos de modelos invertidos
+            WRITE (filename1, '("output_jointGram_gv_minv_c",I1,"_iter",I2,".csv")' ) ciclo, ii
+            OPEN(unit=9,file=filename1,status='unknown') !crear y escribir en archivo
+            WRITE(9,*) 'x[m],y[m],z[m],Density_Contrast[g/cm**3]'
+
+            WRITE (filename2, '("output_jointGram_mg_minv_c",I1,"_iter",I2,".csv")' ) ciclo, ii
+            OPEN(unit=10,file=filename2,status='unknown') !crear y escribir en archivo
+            WRITE(10,*) 'x[m],y[m],z[m],Magnetization_Contrast[A/m]'
+
+            do jj = 1,n,1
+                  WRITE(9,'(F10.3,",",F11.3,",",F10.3,",",E11.4)') xcell(jj),ycell(jj),zcell(jj),mnew_h(jj)
+                  WRITE(10,'(F10.3,",",F11.3,",",F10.3,",",E11.4)') xcell(jj),ycell(jj),zcell(jj),mnew_h(n+jj)
+            end do
+
+            CLOSE(unit=9)
+            CLOSE(unit=10)
+
+            ! Escribir archivos de datos calculados a partir de modelos invertidos
+            WRITE (filename3, '("output_jointGram_gv_anomaly_c",I1,"_iter",I2,".csv")' ) ciclo, ii
+            OPEN(unit=11,file=filename3,status='unknown')
+            WRITE(11,*) 'x[m],y[m],z[m],gv[mGal]'
+
+            WRITE (filename4, '("output_jointGram_mg_anomaly_c",I1,"_iter",I2,".csv")' ) ciclo, ii
+            OPEN(unit=12,file=filename4,status='unknown')
+            WRITE(12,*) 'x[m],y[m],z[m],mg[nT]'
+
+            do kk = 1,m,1
+                  WRITE(11,'(F10.3,",",F11.3,",",F10.3,",",E11.4)') xobs(kk),yobs(kk),zobs_gv(kk),Am_h(kk)
+                  WRITE(12,'(F10.3,",",F11.3,",",F10.3,",",E11.4)') xobs(kk),yobs(kk),zobs_mg(kk),Am_h(m+kk)
+            end do
+
+            CLOSE(unit=11)
+            CLOSE(unit=12)
+            
+            ! Evaluar eficiencia.
+            call cpu_time(finish)
+            OPEN(unit=0,file='output_time.txt',status='old')
+            WRITE(0,*) 'Execution time: CPU part jointGram =', (finish-start), 'seg =', (finish-start)/60, 'min'
+
+      end if
+end do
+
+CLOSE(unit=16)
+
+
+! TERMINAR CALCULOS EN GPU
+istat = cublasDestroy(h)
+if (istat .ne. 0) print *,"cublasDestroy returned ",istat
+
+deallocate ( dxm1,dym1,dzm1,dxm2,dym2,dzm2,dum5,dum6,dum7,dum8,diva,divb,divc,dive, &
+             dxI1,dyI1,dzI1,dxI2,dyI2,dzI2 )
+deallocate ( dx_d,dy_d,dz_d,mIg,mJg,I_new)
+deallocate ( d_gv,d_mg, xobs,yobs,zobs_gv,zobs_mg,xcell,ycell,zcell )
+
+!close(unit=0)
+
+return
+end subroutine jointGramPL5
+!*******************************************************************************
+
+ subroutine jointGramPL6(m,n,nx,ny,nz,step,xobs,yobs,zobs_gv,zobs_mg,xcell,ycell,zcell,d_gv,stdevd_gv,m_gv,stdevm_gv,mapr_gv,A_gv, &
+                        d_mg,stdevd_mg,m_mg,stdevm_mg,mapr_mg,A_mg,param_reg,dip,strike,num_iters,err0,ciclo)
+! Subrutina que calcula inversion conjunta de dos modelos gravimétrico y magnético
+! considerando similitud estructural evaluada por gradientes cruzados implementada mediante el enfoque Gramiano.
+! Procesamiento en CPU y GPU optimizado, balance entre uso de memorias RAM y VRAM.
+
+use cudafor
+use cublas_v2
+use iso_fortran_env , dp => real64
+use auxiliar, only: partialder, laplaciano
+
+implicit none
+
+integer, value :: m, n
+integer, intent(in) :: num_iters, nx, ny, nz, ciclo
+real, intent(in) :: step, err0, dip, strike
+real, dimension(10) :: param_reg
+!real, intent(in), dimension(nx*ny) :: zobs_gv, zobs_mg
+!real, intent(in), dimension(nx*ny) :: d_gv, d_mg, stdevd_gv, stdevd_mg
+!real, intent(in), dimension(nx*ny*nz) :: m_gv, m_mg, mapr_gv, mapr_mg, stdevm_gv, stdevm_mg
+!real(dp), intent(in), dimension(nx*ny,nx*ny*nz) :: A_gv, A_mg
+real, allocatable, dimension (:) :: xobs, yobs, zobs_gv, zobs_mg, xcell, ycell, zcell
+real, allocatable, dimension(:) :: d_gv, d_mg, stdevd_gv, stdevd_mg, m_gv, m_mg, mapr_gv, mapr_mg, stdevm_gv, stdevm_mg
+real(dp), allocatable, dimension(:,:) :: A_gv, A_mg
+
+real(dp), allocatable, dimension(:,:) :: dx, dy, dz, opL, opM
+real(dp), allocatable, dimension(:,:) :: aL2, gM2, eN2
+real(dp), allocatable, dimension(:,:) :: bWm2, Wd2, ATWd2, ATWd2A
+real(dp) :: Ia_gv_h(n,n), Ia_mg_h(n,n)
+
+real(dp), device, dimension(10) :: param_reg_d
+real(dp), device, allocatable, dimension(:,:) :: dx_d, dy_d, dz_d, dum1, dum2
+real(dp), device, allocatable, dimension(:) :: dum3, dum4
+real(dp), device, allocatable, dimension(:,:) :: Wd2_d, ATWd2_d, A_d
+
+real(dp), device :: Ia_gv(n,n), Ia_mg(n,n)
+real(dp), device, dimension(2*n) :: Ib, mn_d
+
+real(dp), device, allocatable, dimension(:) :: dxm1, dym1, dzm1, dxm2, dym2, dzm2, dum5, dum6, dum7, dum8, diva, divb, divc, dive,&
+                                               dxI1, dyI1, dzI1, dxI2, dyI2, dzI2
+real(dp), device, allocatable, dimension(:) :: mIg, mJg, I_new
+
+real(dp), dimension(2*n) :: mJg_h, I_new_h, I, Iconj_new, Iconj, kn_2a
+real(dp) :: kn_1, kn_2b, kn_2c, kn
+real(dp), dimension(2*n) :: m_new
+real(dp) :: Am(2*m), dr(2*m), mn_h(2*n)
+
+real :: conv_gv, conv_mg, rms_gv, rms_mg
+real :: Wd_gv(m), Wd_mg(m)
+integer, value :: ii, jj, kk
+character(len=42) :: filename00, filename1, filename2, filename3, filename4
+real :: start, finish
+
+!variables extra para paralelizar
+type(cublasHandle) :: h
+type(cudaDeviceProp) :: prop
+integer :: istat, n_threads, n_blocks
+real(dp) :: ALPHA=1.0 , BETA=0.0
+
+!**********************
+!Evaluar eficiencia.
+call cpu_time(start)
+
+! INICIAR CALCULOS EN GPU
+istat = cublasCreate(h)
+if (istat .ne. 0) print *,"cublasCreate returned ",istat
+print*, 'Inicia calculo de modelos en GPU'
+
+
+!***********************
+!reservar memoria para arreglos temporales, comentados porque son arreglos heredados del programa principal
+!allocate ( d_gv(m),d_mg(m),mapr_gv(n),mapr_mg(n),m_gv(n),m_mg(n),stdevd_gv(m),stdevd_mg(m),stdevm_gv(n),stdevm_mg(n), &
+!           A_gv(m,n),A_mg(m,n),xcell(n), ycell(n), zcell(n), xobs(m), yobs(m), zobs_gv(m), zobs_mg(m) )
+allocate ( dx(n,n),dy(n,n),dz(n,n),opL(n,n),opM(n,n),dx_d(n,n),dy_d(n,n),dz_d(n,n) )
+
+!matrices para derivadas
+call partialder(nx,ny,nz,step,'x',dx)
+call partialder(nx,ny,nz,step,'y',dy)
+call partialder(nx,ny,nz,step,'z',dz)
+dx_d = dx
+dy_d = dy
+dz_d = dz
+
+!Operador Suavidad
+call laplaciano(nx,ny,nz,step,opL)
+
+!Operador variacion horizontal total
+opM = dx*cos(dip)*cos(strike) + dy*cos(dip)*sin(strike) + dz*sin(dip)
+
+!Operador variacion vertical
+!opN = dz
+param_reg_d = param_reg
+
+deallocate(dx,dy,dz)
+
+
+!***********************
+!para gv
+allocate ( aL2(n,n),gM2(n,n),eN2(n,n),bWm2(n,n),Wd2(m,m),ATWd2(n,m),ATWd2A(n,n) )
+allocate ( dum1(n,n),dum2(n,n),dum3(n),dum4(m),Wd2_d(m,m),ATWd2_d(n,m),A_d(m,n) )
+
+!opL2 = MATMUL(transpose(opL),opL)
+dum1 = opL
+ALPHA = param_reg_d(1)
+istat = cublasDgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,n,n,n,ALPHA,dum1,n,dum1,n,BETA,dum2,n)
+aL2 = dum2
+
+!opM2 = MATMUL(transpose(opM),opM)
+dum1 = opM ; dum2 = 0
+ALPHA = param_reg_d(5)
+istat = cublasDgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,n,n,n,ALPHA,dum1,n,dum1,n,BETA,dum2,n)
+gM2 = dum2
+
+!opN2 = MATMUL(transpose(opN),opN)
+dum1 = dz_d ; dum2 = 0
+ALPHA = param_reg_d(7)
+istat = cublasDgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,n,n,n,ALPHA,dum1,n,dum1,n,BETA,dum2,n)
+eN2 = dum2
+
+!Calculando matrices de pesos W
+!call cov(n,1,stdevm_gv,Wm2)
+dum3 = stdevm_gv ; dum2 = 0
+!$cuf kernel do(2) <<< *,* >>>  !kernel loop directives (CUF kernels)
+do ii = 1, n
+  do jj = 1, n
+    if (ii == jj) then
+      dum2(ii,jj) = param_reg_d(3) * (1/(dum3(ii)**2))
+    else
+      dum2(ii,jj) = 0
+    end if
+  end do
+end do
+bWm2 = dum2
+
+!call cov(m,1,stdevd_gv,Wd2)
+dum4 = stdevd_gv
+!$cuf kernel do(2) <<< *,* >>>  !kernel loop directives (CUF kernels)
+do ii = 1, m
+  do jj = 1, m
+    if (ii == jj) then
+      Wd2_d(ii,jj) = 1/(dum4(ii)**2)
+    else
+      Wd2_d(ii,jj) = 0
+    end if
+  end do
+end do
+Wd2 = Wd2_d
+!Recordar W**2 = C-1 = 1/(stdev**2) = 1/varianza (type=1). Pesos W son 1/stdev (type=2).
+Wd_gv = 1/stdevd_gv
+
+A_d = A_gv
+ALPHA = 1.0
+!ATWd2 = MATMUL(transpose(A_gv),Wd2)
+istat = cublasDgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,size(A_d,2),size(Wd2_d,2),size(A_d,1),ALPHA, &
+                    A_d,size(A_d,1),Wd2_d,size(Wd2_d,1),BETA,ATWd2_d,size(ATWd2_d,1))
+ATWd2 = ATWd2_d ; dum1 = 0
+!ATWd2A = MATMUL(ATWd2,A_gv)
+istat = cublasDgemm(h,CUBLAS_OP_N,CUBLAS_OP_N,size(ATWd2_d,1),size(A_d,2),size(ATWd2_d,2),ALPHA, &
+                    ATWd2_d,size(ATWd2_d,1),A_d,size(A_d,1),BETA,dum1,size(dum1,1))
+ATWd2A = dum1
+
+!Para calcular direccion de descenso I(m)
+Ia_gv_h = ATWd2A + aL2 + bWm2 + gM2 + eN2
+Ia_gv = Ia_gv_h
+
+
+!Ib(1:n) = MATMUL(ATWd2,d_gv) + MATMUL(bWm2,mapr_gv)
+dum4 = d_gv
+dum3 = mapr_gv
+BETA = 0.0
+istat = cublasDgemv(h,CUBLAS_OP_N,size(ATWd2_d,1),size(ATWd2_d,2),ALPHA,ATWd2_d,size(ATWd2_d,1),dum4,1,BETA, &
+                    Ib(1:n),1)
+BETA = 1.0
+istat = cublasDgemv(h,CUBLAS_OP_N,size(dum2,1),size(dum2,2),ALPHA,dum2,size(dum2,1),dum3,1,BETA,Ib(1:n),1)
+
+mn_h(1:n) = m_gv
+mn_d(1:n) = m_gv
+deallocate (stdevd_gv,stdevm_gv,mapr_gv,m_gv)
+
+!**********************
+!para mg
+aL2=0; gM2=0; eN2=0; bWm2=0; Wd2=0; ATWd2=0; ATWd2A=0
+dum1=0; dum2=0; dum3=0; dum4=0; Wd2_d=0; ATWd2_d=0; A_d=0
+
+!opL2 = MATMUL(transpose(opL),opL)
+dum1 = opL
+ALPHA = param_reg_d(2)
+istat = cublasDgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,n,n,n,ALPHA,dum1,n,dum1,n,BETA,dum2,n)
+aL2 = dum2
+
+!opM2 = MATMUL(transpose(opM),opM)
+dum1 = opM ; dum2 = 0
+ALPHA = param_reg_d(6)
+istat = cublasDgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,n,n,n,ALPHA,dum1,n,dum1,n,BETA,dum2,n)
+gM2 = dum2
+
+!opN2 = MATMUL(transpose(opN),opN)
+dum1 = dz_d ; dum2 = 0
+ALPHA = param_reg_d(8)
+istat = cublasDgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,n,n,n,ALPHA,dum1,n,dum1,n,BETA,dum2,n)
+eN2 = dum2
+
+!Calculando matrices de pesos W
+!call cov(n,1,stdevm_mg,Wm2)
+dum3 = stdevm_mg ; dum2 = 0
+!$cuf kernel do(2) <<< *,* >>>  !kernel loop directives (CUF kernels)
+do ii = 1, n
+  do jj = 1, n
+    if (ii == jj) then
+      dum2(ii,jj) = param_reg_d(4) * (1/(dum3(ii)**2))
+    else
+      dum2(ii,jj) = 0
+    end if
+  end do
+end do
+bWm2 = dum2
+
+!call cov(m,1,stdevd_mg,Wd2)
+dum4 = stdevd_mg
+!$cuf kernel do(2) <<< *,* >>>  !kernel loop directives (CUF kernels)
+do ii = 1, m
+  do jj = 1, m
+    if (ii == jj) then
+      Wd2_d(ii,jj) = 1/(dum4(ii)**2)
+    else
+      Wd2_d(ii,jj) = 0
+    end if
+  end do
+end do
+Wd2 = Wd2_d
+!Recordar W**2 = C-1 = 1/(stdev**2) = 1/varianza (type=1). Pesos W son 1/stdev (type=2).
+Wd_mg = 1/stdevd_mg
+
+A_d = A_mg
+ALPHA = 1.0
+!ATWd2 = MATMUL(transpose(A_gv),Wd2)
+istat = cublasDgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,size(A_d,2),size(Wd2_d,2),size(A_d,1),ALPHA, &
+                    A_d,size(A_d,1),Wd2_d,size(Wd2_d,1),BETA,ATWd2_d,size(ATWd2_d,1))
+ATWd2 = ATWd2_d ; dum1 = 0
+!ATWd2A = MATMUL(ATWd2,A_gv)
+istat = cublasDgemm(h,CUBLAS_OP_N,CUBLAS_OP_N,size(ATWd2_d,1),size(A_d,2),size(ATWd2_d,2),ALPHA, &
+                    ATWd2_d,size(ATWd2_d,1),A_d,size(A_d,1),BETA,dum1,size(dum1,1))
+ATWd2A = dum1
+
+!Para calcular direccion de descenso I(m)
+Ia_mg_h = ATWd2A + aL2 + bWm2 + gM2 + eN2
+Ia_mg = Ia_mg_h
+
+
+!Ib(n+1:2*n) = MATMUL(ATWd2,d_gv) + MATMUL(bWm2,mapr_gv)
+dum4 = d_mg
+dum3 = mapr_mg
+BETA = 0.0
+istat = cublasDgemv(h,CUBLAS_OP_N,size(ATWd2_d,1),size(ATWd2_d,2),ALPHA,ATWd2_d,size(ATWd2_d,1),dum4,1,BETA, &
+                    Ib(n+1:2*n),1)
+BETA = 1.0
+istat = cublasDgemv(h,CUBLAS_OP_N,size(dum2,1),size(dum2,2),ALPHA,dum2,size(dum2,1),dum3,1,BETA,Ib(n+1:2*n),1)
+
+mn_h(n+1:2*n) = m_mg
+mn_d(n+1:2*n) = m_mg
+deallocate (stdevd_mg,stdevm_mg,mapr_mg,m_mg)
+
+deallocate (opL,opM,aL2,gM2,eN2,bWm2,Wd2,ATWd2,ATWd2A)
+deallocate (dum1,dum2,dum3,dum4,Wd2_d,ATWd2_d,A_d)
+
+
+!**********************
+allocate ( dxm1(n),dym1(n),dzm1(n),dxm2(n),dym2(n),dzm2(n),dum5(n),dum6(n),dum7(n),dum8(n),diva(n),divb(n),divc(n),dive(n), &
+           dxI1(n),dyI1(n),dzI1(n),dxI2(n),dyI2(n),dzI2(n) )
+allocate ( mIg(2*n), mJg(2*n), I_new(2*n) )
+
+
+WRITE (filename00, '("output_misfit_jointGram_c",I1,".txt")' ) ciclo
+OPEN(unit=16,file=filename00,status='unknown')
+WRITE(16,*) 'iteracion,convergencia%_gv,convergencia%_mg,RMS_gv,RMS_mg'
+
+!Método iterativo Gradiente Conjugado Regularizado RCG.
+conv_gv = 1e6 !error inicial (valor arbitrario grande)
+conv_mg = 1e6
+! Condicion de paro
+do ii = 1,num_iters,1 
+      if ((conv_gv > err0).and.(conv_mg > err0)) then
+            
+            !Definir numero de hilos y bloques para arreglos 1D
+            istat = cudaGetDeviceProperties(prop, 0)  ! Supongo que sólo se tiene acceso a una GPU
+            n_threads = prop%maxThreadsPerBlock
+            n_blocks  = ceiling(real(n)/n_threads)
+
+            !Preparativos para calcular I(m).
+            !matrices de derivadas con laplaciano
+            !dxm1 = MATMUL(dx,m_n(1:n))
+            !dym1 = MATMUL(dy,m_n(1:n))
+            !dzm1 = MATMUL(dz,m_n(1:n))
+            !dxm2 = MATMUL(dx,m_n(n+1:2*n))
+            !dym2 = MATMUL(dy,m_n(n+1:2*n))
+            !dzm2 = MATMUL(dz,m_n(n+1:2*n))
+            ALPHA = 1.
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),mn_d(1:n),1,BETA,dxm1,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),mn_d(1:n),1,BETA,dym1,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),mn_d(1:n),1,BETA,dzm1,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),mn_d(n+1:2*n),1,BETA,dxm2,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),mn_d(n+1:2*n),1,BETA,dym2,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),mn_d(n+1:2*n),1,BETA,dzm2,1)
+
+
+            !Ig
+            !ter1 = (dxm1*dxm2)+(dym1*dym2)+(dzm1*dzm2) !producto interno nabla_m1,nabla_m2
+            dum5 = 0
+            call prod<<<n_blocks,n_threads>>>(dxm1,dxm2,dum5,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dym1,dym2,dum5,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(dzm1,dzm2,dum5,1.,1.)
+            !ax = ter1*dxm2 !array operation
+            !ay = ter1*dym2
+            !az = ter1*dzm2
+            dum6=0; dum7=0; dum8=0
+            call prod<<<n_blocks,n_threads>>>(dum5,dxm2,dum6,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dum5,dym2,dum7,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dum5,dzm2,dum8,1.,0.)
+            !diva = MATMUL(dx,ax) + MATMUL(dy,ay) + MATMUL(dz,az)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),dum6,1,BETA,diva,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),dum7,1,BETA,diva,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),dum8,1,BETA,diva,1)
+          
+            !cx = ter1*dxm1
+            !cy = ter1*dym1
+            !cz = ter1*dzm1
+            dum6=0; dum7=0; dum8=0
+            call prod<<<n_blocks,n_threads>>>(dum5,dxm1,dum6,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dum5,dym1,dum7,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dum5,dzm1,dum8,1.,0.)
+            !divc = MATMUL(dx,cx) + MATMUL(dy,cy) + MATMUL(dz,cz)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),dum6,1,BETA,divc,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),dum7,1,BETA,divc,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),dum8,1,BETA,divc,1)
+          
+            !ter2 = (dxm2**2) + (dym2**2) + (dzm2**2) !modulo cuadrado de m2
+            dum5 = 0
+            call prod<<<n_blocks,n_threads>>>(dxm2,dxm2,dum5,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dym2,dym2,dum5,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(dzm2,dzm2,dum5,1.,1.)
+            !bx = ter2*dxm1 
+            !by = ter2*dym1
+            !bz = ter2*dzm1
+            dum6=0; dum7=0; dum8=0
+            call prod<<<n_blocks,n_threads>>>(dum5,dxm1,dum6,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dum5,dym1,dum7,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dum5,dzm1,dum8,1.,0.)
+            !divb = MATMUL(dx,bx) + MATMUL(dy,by) + MATMUL(dz,bz)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),dum6,1,BETA,divb,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),dum7,1,BETA,divb,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),dum8,1,BETA,divb,1)
+            
+            !ter3 = (dxm1**2) + (dym1**2) + (dzm1**2) !modulo cuadrado de m1
+            dum5 = 0
+            call prod<<<n_blocks,n_threads>>>(dxm1,dxm1,dum5,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dym1,dym1,dum5,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(dzm1,dzm1,dum5,1.,1.)
+            !ex = ter3*dxm2
+            !ey = ter3*dym2
+            !ez = ter3*dzm2
+            dum6=0; dum7=0; dum8=0
+            call prod<<<n_blocks,n_threads>>>(dum5,dxm2,dum6,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dum5,dym2,dum7,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dum5,dzm2,dum8,1.,0.)
+            !dive = MATMUL(dx,ex) + MATMUL(dy,ey) + MATMUL(dz,ez)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),dum6,1,BETA,dive,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),dum7,1,BETA,dive,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),dum8,1,BETA,dive,1)
+
+
+            !mIg(1:n) = param_reg_d(9) * (diva - divb)
+            !mIg(n+1:2*n) = param_reg_d(10) * (divc - dive)
+            !$cuf kernel do <<<*,*>>>   !kernel loop directives (CUF kernels)
+            do kk = 1, n
+                  mIg(kk) = param_reg_d(9) * (diva(kk) - divb(kk))
+                  mIg(n+kk) = param_reg_d(10) * (divc(kk) - dive(kk))
+            enddo
+
+            !Calculando direccion de ascenso I(m) por descenso más pronunciado. 
+            !I_new = mIg - Ib
+            !$cuf kernel do <<<*,*>>>   !kernel loop directives (CUF kernels)
+            do kk = 1, 2*n
+                  I_new(kk) = mIg(kk) - Ib(kk)
+            enddo
+            !I_new = MATMUL(I_a,m_n) + (mI_G - I_b)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(Ia_gv,1),size(Ia_gv,2),ALPHA,Ia_gv,size(Ia_gv,1),mn_d(1:n),1,BETA,&
+                                I_new(1:n),1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(Ia_mg,1),size(Ia_mg,2),ALPHA,Ia_mg,size(Ia_mg,1),mn_d(n+1:2*n),1,BETA,&
+                                I_new(n+1:2*n),1)
+
+            ! Bajar arreglos a host y subir separado para siguiente parte.
+            I_new_h = I_new !aqui podría iniciar una segunda hebra
+
+            !Reset variables temporales.
+            diva=0; divb=0; divc=0; dive=0
+
+            !Jg
+            !dxI1 = MATMUL(dx,I_new(1:n))
+            !dyI1 = MATMUL(dy,I_new(1:n))
+            !dzI1 = MATMUL(dz,I_new(1:n))
+            !dxI2 = MATMUL(dx,I_new(n+1:2*n))
+            !dyI2 = MATMUL(dy,I_new(n+1:2*n))
+            !dzI2 = MATMUL(dz,I_new(n+1:2*n))
+            ALPHA = 1.
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),I_new(1:n),1,BETA,dxI1,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),I_new(1:n),1,BETA,dyI1,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),I_new(1:n),1,BETA,dzI1,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),I_new(n+1:2*n),1,BETA,dxI2,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),I_new(n+1:2*n),1,BETA,dyI2,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),I_new(n+1:2*n),1,BETA,dzI2,1)
+
+            !ter1J = (dxm2*dxI1)+(dym2*dyI1)+(dzm2*dzI1) !producto interno nabla_m2,nabla_I
+            dum5 = 0
+            call prod<<<n_blocks,n_threads>>>(dxm2,dxI1,dum5,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dym2,dyI1,dum5,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(dzm2,dzI1,dum5,1.,1.)
+            !axJ = ter1J*dxm2
+            !ayJ = ter1J*dym2
+            !azJ = ter1J*dzm2
+            dum6=0; dum7=0; dum8=0
+            call prod<<<n_blocks,n_threads>>>(dum5,dxm2,dum6,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dum5,dym2,dum7,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dum5,dzm2,dum8,1.,0.)           
+            !divaJ = MATMUL(dx,axJ) + MATMUL(dy,ayJ) + MATMUL(dz,azJ)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),dum6,1,BETA,diva,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),dum7,1,BETA,diva,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),dum8,1,BETA,diva,1)
+
+            !ter2 = (dxm2**2) + (dym2**2) + (dzm2**2) !modulo cuadrado de m2
+            dum5 = 0
+            call prod<<<n_blocks,n_threads>>>(dxm2,dxm2,dum5,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dym2,dym2,dum5,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(dzm2,dzm2,dum5,1.,1.)
+            !bxJ = ter2*dxI1
+            !byJ = ter2*dyI1
+            !bzJ = ter2*dzI1
+            dum6=0; dum7=0; dum8=0
+            call prod<<<n_blocks,n_threads>>>(dum5,dxI1,dum6,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dum5,dyI1,dum7,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dum5,dzI1,dum8,1.,0.)
+            !divbJ = MATMUL(dx,bxJ) + MATMUL(dy,byJ) + MATMUL(dz,bzJ)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),dum6,1,BETA,divb,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),dum7,1,BETA,divb,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),dum8,1,BETA,divb,1)
+            
+            !ter2J = (dxm1*dxI2)+(dym1*dyI2)+(dzm1*dzI2) !producto interno nabla_m1,nabla_I
+            dum5 = 0
+            call prod<<<n_blocks,n_threads>>>(dxm1,dxI2,dum5,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dym1,dyI2,dum5,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(dzm1,dzI2,dum5,1.,1.)
+            !cxJ = ter2J*dxm1
+            !cyJ = ter2J*dym1
+            !czJ = ter2J*dzm1
+            dum6=0; dum7=0; dum8=0
+            call prod<<<n_blocks,n_threads>>>(dum5,dxm1,dum6,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dum5,dym1,dum7,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dum5,dzm1,dum8,1.,0.) 
+            !divcJ = MATMUL(dx,cxJ) + MATMUL(dy,cyJ) + MATMUL(dz,czJ)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),dum6,1,BETA,divc,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),dum7,1,BETA,divc,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),dum8,1,BETA,divc,1)
+
+            !ter3 = (dxm1**2) + (dym1**2) + (dzm1**2) !modulo cuadrado de m1
+            dum5 = 0
+            call prod<<<n_blocks,n_threads>>>(dxm1,dxm1,dum5,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dym1,dym1,dum5,1.,1.)
+            call prod<<<n_blocks,n_threads>>>(dzm1,dzm1,dum5,1.,1.)
+            !exJ = ter3*dxI2
+            !eyJ = ter3*dyI2
+            !ezJ = ter3*dzI2
+            dum6=0; dum7=0; dum8=0
+            call prod<<<n_blocks,n_threads>>>(dum5,dxI2,dum6,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dum5,dyI2,dum7,1.,0.)
+            call prod<<<n_blocks,n_threads>>>(dum5,dzI2,dum8,1.,0.) 
+            !diveJ = MATMUL(dx,exJ) + MATMUL(dy,eyJ) + MATMUL(dz,ezJ)
+            BETA = 0.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dx_d,1),size(dx_d,2),ALPHA,dx_d,size(dx_d,1),dum6,1,BETA,dive,1)
+            BETA = 1.
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dy_d,1),size(dy_d,2),ALPHA,dy_d,size(dy_d,1),dum7,1,BETA,dive,1)
+            istat = cublasDgemv(h,CUBLAS_OP_N,size(dz_d,1),size(dz_d,2),ALPHA,dz_d,size(dz_d,1),dum8,1,BETA,dive,1)
+
+
+            !mJg(1:n) = param_reg_d(9) * (divaJ - divbJ)
+            !mJg(n+1:2*n) = param_reg_d(10) * (divcJ - diveJ)
+            !$cuf kernel do <<<*,*>>>   !kernel loop directives (CUF kernels)
+            do kk = 1, n
+                  mJg(kk) = param_reg_d(9) * (diva(kk) - divb(kk))
+                  mJg(n+kk) = param_reg_d(10) * (divc(kk) - dive(kk))
+            enddo
+
+            ! Bajar arreglos a host
+            mJg_h = mJg
+
+
+            ! Evaluar eficiencia.
+            call cpu_time(finish)
+            OPEN(unit=0,file='output_time.txt',status='old')
+            WRITE(0,*) 'Execution time: GPU part jointGram =', (finish-start), 'seg =', (finish-start)/60, 'min'
+            !print*, 'Calculo de errores y generacion de archivos de salida en CPU iteracion:', ii
+            call cpu_time(start)
+
+            
+            !Direccion de ascenso mediante gradientes conjugados.
+            if (ii == 1) then
+                  Iconj_new = I_new_h
+            else
+                  Iconj_new = I_new_h + ( (DOT_PRODUCT(I_new_h,I_new_h)/DOT_PRODUCT(I,I)) * Iconj )
+            end if
+
+
+            ! Tamaño de paso kn en la dirección I(m).
+            kn_1 = DOT_PRODUCT(Iconj_new,I_new_h)
+
+            kn_2a(1:n) = MATMUL(Ia_gv_h,Iconj_new(1:n))
+            kn_2a(n+1:2*n) = MATMUL(Ia_mg_h,Iconj_new(n+1:2*n))
+            
+            kn_2b = DOT_PRODUCT(Iconj_new,kn_2a)
+            kn_2c = DOT_PRODUCT(Iconj_new,mJg_h)
+
+            kn = kn_1 / (kn_2b + kn_2c +1e-10)  !para evitar divisiones por cero
+
+            !Calculo m_new
+            m_new = mn_h - (kn*Iconj_new) !array operation
+            ! Subir arreglos a device para siguiente iteracion
+            mn_d = m_new
+
+            !***************************
+            !Convergencia
+            conv_gv = 100 * SQRT( SUM( ((m_new(1:n)-mn_h(1:n))**2)/((mn_h(1:n)**2)+1e-10) )/n )
+            conv_mg = 100 * SQRT( SUM( ((m_new(n+1:2*n)-mn_h(n+1:2*n))**2)/((mn_h(n+1:2*n)**2)+1e-10) )/n )
+
+            !Actualizando variables para la siguiente iteración
+            mn_h = m_new
+            I = I_new_h
+            Iconj = Iconj_new
+
+
+            !Obteniendo datos calculados
+            Am(1:m) = MATMUL(A_gv,m_new(1:n))
+            Am(m+1:2*m) = MATMUL(A_mg,m_new(n+1:2*n))
+
+            !RMS
+            dr(1:m) = Am(1:m) - d_gv !array operation
+            dr(m+1:2*m) = Am(m+1:2*m) - d_mg
+            dr(1:m) = Wd_gv * dr(1:m) !array operation
+            dr(m+1:2*m) = Wd_mg * dr(m+1:2*m)
+
+            rms_gv = DOT_PRODUCT(dr(1:m),dr(1:m))
+            rms_gv = SQRT(rms_gv/m)
+
+            rms_mg = DOT_PRODUCT(dr(m+1:2*m),dr(m+1:2*m))
+            rms_mg = SQRT(rms_mg/m)
+
+            WRITE(16,'(I3,",",F14.4,",",F14.4,",",F10.4,",",F10.4)') ii,conv_gv,conv_mg,rms_gv,rms_mg
+
+            
+            !Escribir resultados
+            ! Escribir archivos de modelos invertidos
+            WRITE (filename1, '("output_jointGram_gv_minv_c",I1,"_iter",I2,".csv")' ) ciclo, ii
+            OPEN(unit=9,file=filename1,status='unknown') !crear y escribir en archivo
+            WRITE(9,*) 'x[m],y[m],z[m],Density_Contrast[g/cm**3]'
+
+            WRITE (filename2, '("output_jointGram_mg_minv_c",I1,"_iter",I2,".csv")' ) ciclo, ii
+            OPEN(unit=10,file=filename2,status='unknown') !crear y escribir en archivo
+            WRITE(10,*) 'x[m],y[m],z[m],Magnetization_Contrast[A/m]'
+
+            do jj = 1,n,1
+                  WRITE(9,'(F10.3,",",F11.3,",",F10.3,",",E11.4)') xcell(jj),ycell(jj),zcell(jj),m_new(jj)
+                  WRITE(10,'(F10.3,",",F11.3,",",F10.3,",",E11.4)') xcell(jj),ycell(jj),zcell(jj),m_new(n+jj)
+            end do
+
+            CLOSE(unit=9)
+            CLOSE(unit=10)
+
+            ! Escribir archivos de datos calculados a partir de modelos invertidos
+            WRITE (filename3, '("output_jointGram_gv_anomaly_c",I1,"_iter",I2,".csv")' ) ciclo, ii
+            OPEN(unit=11,file=filename3,status='unknown') !crear y escribir en archivo
+            WRITE(11,*) 'x[m],y[m],z[m],gv[mGal]'
+
+            WRITE (filename4, '("output_jointGram_mg_anomaly_c",I1,"_iter",I2,".csv")' ) ciclo, ii
+            OPEN(unit=12,file=filename4,status='unknown') !crear y escribir en archivo
+            WRITE(12,*) 'x[m],y[m],z[m],mg[nT]'
+
+            do kk = 1,m,1
+                  WRITE(11,'(F10.3,",",F11.3,",",F10.3,",",E11.4)') xobs(kk),yobs(kk),zobs_gv(kk),Am(kk)
+                  WRITE(12,'(F10.3,",",F11.3,",",F10.3,",",E11.4)') xobs(kk),yobs(kk),zobs_mg(kk),Am(m+kk)
+            end do
+
+            CLOSE(unit=11)
+            CLOSE(unit=12)
+            
+            ! Evaluar eficiencia.
+            call cpu_time(finish)
+            OPEN(unit=0,file='output_time.txt',status='old')
+            WRITE(0,*) 'Execution time: CPU part jointGram =', (finish-start), 'seg =', (finish-start)/60, 'min'
+
+      end if
+end do
+
+CLOSE(unit=16)
+
+
+! TERMINAR CALCULOS EN GPU
+istat = cublasDestroy(h)
+if (istat .ne. 0) print *,"cublasDestroy returned ",istat
+
+deallocate ( dxm1,dym1,dzm1,dxm2,dym2,dzm2,dum5,dum6,dum7,dum8,diva,divb,divc,dive, &
+             dxI1,dyI1,dzI1,dxI2,dyI2,dzI2 )
+deallocate ( dx_d,dy_d,dz_d,mIg,mJg,I_new)
+deallocate ( A_gv,A_mg,d_gv,d_mg, xobs,yobs,zobs_gv,zobs_mg,xcell,ycell,zcell )
+
+!close(unit=0)
+
+return
+end subroutine jointGramPL6
+!*******************************************************************************
+
+
+!*******************************************************************************
+
+attributes(global) subroutine prod(A, B, C, ALPHA, BETA)
+!producto de vectores element-wise en cuda fortran
+
+use iso_fortran_env , dp => real64
+
+implicit none
+
+real, value :: ALPHA, BETA
+real(dp), device, dimension(:) :: A, B ,C
+integer :: id
+real(dp) :: e1, e2, r
+
+id = (blockIdx%x -1)* blockDim%x + threadIdx%x 
+
+if (id <= size(A)) then
+      e1 = A(id)
+      e2 = B(id)
+      r = e1 * e2
+      C(id) = ALPHA*r + C(id)*BETA
+      id = id + blockDim%x * gridDim%x
+end if
+
+end subroutine prod
+!*******************************************************************************
+
+attributes(global) subroutine adi(A, B, C, ALPHA, BETA)
+!adicion de vectores element-wise en cuda fortran
+
+use iso_fortran_env , dp => real64
+
+implicit none
+real, value :: ALPHA, BETA
+real(dp), device, dimension(:) :: A, B, C
+integer :: id
+real(dp) :: e1, e2, r
+
+id = (blockIdx%x -1)* blockDim%x + threadIdx%x 
+
+if (id <= size(A)) then
+      e1 = A(id)
+      e2 = B(id)
+      r = e1 + e2
+      C(id) =  ALPHA*r + C(id)*BETA
+      id = id + blockDim%x * gridDim%x
+end if
+
+end subroutine adi
+!*******************************************************************************
+
+attributes(global) subroutine sus(A, B, C, ALPHA, BETA)
+!sustraccion de vectores element-wise en cuda fortran
+
+use iso_fortran_env , dp => real64
+
+implicit none
+real, value :: ALPHA, BETA
+real(dp), device, dimension(:) :: A, B, C
+integer :: id
+real(dp) :: e1, e2, r
+
+id = (blockIdx%x -1)* blockDim%x + threadIdx%x 
+
+if (id <= size(A)) then
+      e1 = A(id)
+      e2 = B(id)
+      r = e1 - e2
+      C(id) =  ALPHA*r + C(id)*BETA
+      id = id + blockDim%x * gridDim%x
+end if
+
+end subroutine sus
+!*******************************************************************************
+
+attributes(global) subroutine div(A, B, C, ALPHA, BETA)
+!division de vectores element-wise en cuda fortran
+
+use iso_fortran_env , dp => real64
+
+implicit none
+
+real, value :: ALPHA, BETA
+real(dp), device, dimension(:) :: A, B ,C
+integer :: id
+real(dp) :: e1, e2, r
+
+id = (blockIdx%x -1)* blockDim%x + threadIdx%x 
+
+if (id <= size(A)) then
+      e1 = A(id)
+      e2 = B(id)
+      r = e1 / e2
+      C(id) = ALPHA*r + C(id)*BETA
+      id = id + blockDim%x * gridDim%x
+end if
+
+end subroutine div
+!*******************************************************************************
+
+attributes(global) subroutine avec(A, B, ALPHA, BETA)
+!producto de vector y escalar element-wise en cuda fortran
+
+use iso_fortran_env , dp => real64
+
+implicit none
+
+real(dp), value :: ALPHA
+real, value :: BETA
+real(dp), device, dimension(:) :: A, B
+integer :: id
+
+id = (blockIdx%x -1)* blockDim%x + threadIdx%x 
+
+if (id <= size(A)) then
+      B(id) = ALPHA*A(id) + B(id)*BETA
+      id = id + blockDim%x * gridDim%x
+end if
+
+end subroutine avec
+!*******************************************************************************
+
+attributes(global) subroutine adi_ma(A, B, C, BETA)
+!suma de matrices element-wise en cuda fortran
+!a_ij = a[i,j], where a is in col major order
+
+use iso_fortran_env , dp => real64
+
+implicit none
+integer, value :: BETA
+real(dp), device, dimension(:,:) :: A, B, C
+integer :: row, col
+
+row = threadIdx%x + (blockIdx%x - 1) * blockDim%x
+col = threadIdx%y + (blockIdx%y - 1) * blockDim%y
+
+if ( row<=size(A,1) .and. col<=size(A,2) ) then
+	C(row,col) = A(row,col) + B(row,col) + BETA*C(row,col)
+end if
+
+end subroutine adi_ma
+!*******************************************************************************
+
+end module inversion_parallel
+!*******************************************************************************
+!compilar como:
+!nvfortran inversion_parallel.cuf -o inversion_parallel.o -cudalib=cublas -lblas -cuda
